@@ -957,7 +957,7 @@ def render_news(symbol, display_name):
 # 頁面設定與 Session State
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="簡易股票分析儀", layout="wide")
-st.title("📈 智慧股票分析儀表板")
+st.title("📈 股票分析")
 
 # 重新執行時 Streamlit 會把舊內容變淡（反白），這段 CSS 讓畫面維持原樣
 st.markdown(
