@@ -1434,8 +1434,8 @@ def render_beacons(slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res
 # ---------------------------------------------------------------------------
 # 頁面設定與 Session State
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="簡易股票分析儀", layout="wide")
-st.title("📈 智慧股票分析儀表板")
+st.set_page_config(page_title="股票分析", layout="wide")
+st.title("📈 股票分析")
 
 # 重新執行時 Streamlit 會把舊內容變淡（反白），這段 CSS 讓畫面維持原樣
 st.markdown(
