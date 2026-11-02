@@ -1346,12 +1346,6 @@ def _beacon_items(pe_ratio, eps_last4, inst_table, daily_res, monthly_res):
     """回傳 [(指標名稱, 狀態, 說明)]，狀態：True=達到、False=未達到、None=資料不足。"""
     items = []
 
-    # 1. 本益比 < 30
-    if isinstance(pe_ratio, (int, float)) and pe_ratio > 0:
-        items.append(("本益比 < 30", pe_ratio < 30, f"目前本益比 {pe_ratio:.2f}"))
-    else:
-        items.append(("本益比 < 30", None, "無本益比資料（可能為虧損或資料缺漏）"))
-
     # 2. 連續四季 EPS 為正
     if eps_last4 is not None and len(eps_last4) >= 4:
         last4 = list(eps_last4.head(4).values)
@@ -1423,28 +1417,188 @@ def _ma20_cross_state(daily_res):
     return False, f"{when}由上往下跌破月線（距月線 {gap:+.1f}%）"
 
 
-def render_beacons(slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res):
-    items = _beacon_items(pe_ratio, eps_last4, inst_table, daily_res, monthly_res)
-    valid = [ok for _, ok, _ in items if ok is not None]
-    hit = sum(1 for ok in valid if ok)
+def render_beacons(slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res, fund_items=None, tech_items=None):
+    # 全部燈號整合成同一份清單：(名稱, 狀態, 說明, 判斷標準)
+    items = [(n, ok, d, "") for n, ok, d in _beacon_items(pe_ratio, eps_last4, inst_table, daily_res, monthly_res)]
+    for n, abbr, ok, d, std in (fund_items or []) + (tech_items or []):
+        items.append((f"{n}（{abbr}）", ok, d, std))
+    # 統一轉成 Python 布林（numpy 的 True/False 用 `is True` 判斷會落空，導致統計漏算）
+    items = [(n, None if ok is None else bool(ok), d, std) for n, ok, d, std in items]
+
+    red = sum(1 for _, ok, _, _ in items if ok is True)
+    green = sum(1 for _, ok, _, _ in items if ok is False)
+    white = sum(1 for _, ok, _, _ in items if ok is None)
 
     with slot.container():
         st.markdown("##### 🚦 購買指標燈號")
+        st.markdown(
+            f"🔴 紅燈 **{red}** 個　🟢 綠燈 **{green}** 個"
+            + (f"　⚪ 資料不足 **{white}** 個" if white else "")
+        )
         per_row = 4
         for start in range(0, len(items), per_row):
             cols = st.columns(per_row)
-            for col, (name, ok, detail) in zip(cols, items[start:start + per_row]):
+            for col, (name, ok, detail, std) in zip(cols, items[start:start + per_row]):
                 lamp = "⚪" if ok is None else ("🔴" if ok else "🟢")
-                state = "資料不足" if ok is None else ("達到" if ok else "未達到")
                 col.markdown(f"### {lamp}")
                 col.markdown(f"**{name}**")
-                col.caption(f"{state}｜{detail}")
-        st.caption(
-            f"目前達到 **{hit} / {len(valid)}** 項（資料不足的項目不計入）。"
-            "🔴 紅燈＝達到條件　🟢 綠燈＝未達到　⚪ 白燈＝資料不足。"
-            "外資、投信、自營商各自從最新一天往回數連續買超天數；日K、月K以趨勢分析中偏多訊號數與偏空訊號數比較；月線指日K的 20 日均線，股價在月線之上亮紅燈、之下亮綠燈。"
-            "僅為條件檢查，不構成投資建議。"
-        )
+                col.caption(detail, help=std or None)
+
+
+# ---------------------------------------------------------------------------
+# 基本面／技術面指標燈號（放在購買指標燈號下方）
+# 判斷門檻集中在這裡，想調整標準直接改這幾個數字即可
+# ---------------------------------------------------------------------------
+FUND_PER_MAX = 20       # 本益比 ≤ 此值 → 紅燈
+FUND_PBR_MAX = 1.0      # 股價淨值比 < 此值 → 紅燈
+FUND_YIELD_MIN = 4.0    # 現金股利殖利率 > 此值(%) → 紅燈
+FUND_ROE_MIN = 15.0     # ROE > 此值(%) → 紅燈
+BIAS_OVERHEAT = 10.0    # 乖離率(20日) 未達此值(%)（未過熱）→ 紅燈
+
+
+def _trailing_cash_dividend(dividends_series, info):
+    """近一年累計現金股利；抓不到再退回 Yahoo 的年度股利。"""
+    try:
+        if dividends_series is not None and not dividends_series.empty:
+            idx = pd.to_datetime(dividends_series.index).tz_localize(None)
+            cutoff = pd.Timestamp.now().tz_localize(None) - pd.Timedelta(days=365)
+            total = float(dividends_series[idx >= cutoff].sum())
+            if total > 0:
+                return total
+    except Exception:
+        pass
+    backup = info.get("trailingAnnualDividendRate", info.get("dividendRate", 0))
+    return float(backup) if isinstance(backup, (int, float)) and backup > 0 else 0.0
+
+
+def _fundamental_items(info, pe_ratio, eps_quarterly, dividends_series, latest_close):
+    """基本面：回傳 [(名稱, 英文簡稱, 狀態, 說明, 判斷標準)]，狀態 True=達標(紅燈)、False=未達標(綠燈)、None=資料不足。"""
+    items = []
+
+    # 1. 本益比 PER
+    std = f"≤ {FUND_PER_MAX} 倍視為合理偏低；過高可能代表泡沫化或成長性極強"
+    if isinstance(pe_ratio, (int, float)) and pe_ratio > 0:
+        items.append(("本益比", "PER", pe_ratio <= FUND_PER_MAX, f"目前 {pe_ratio:.2f} 倍", std))
+    else:
+        items.append(("本益比", "PER", None, "無本益比資料（可能為虧損或資料缺漏）", std))
+
+    # 2. 股價淨值比 PBR
+    std = f"< {FUND_PBR_MAX:g} 代表股價低於每股淨值，具資產防禦價值"
+    pbr = info.get("priceToBook")
+    if isinstance(pbr, (int, float)) and pbr > 0:
+        items.append(("股價淨值比", "PBR", pbr < FUND_PBR_MAX, f"目前 {pbr:.2f} 倍", std))
+    else:
+        items.append(("股價淨值比", "PBR", None, "無股價淨值比資料", std))
+
+    # 3. 現金股利殖利率
+    std = f"> {FUND_YIELD_MIN:g}% 具長期存股吸引力"
+    cash = _trailing_cash_dividend(dividends_series, info)
+    if isinstance(latest_close, (int, float)) and latest_close > 0:
+        dy = cash / latest_close * 100
+        detail = f"近一年配息 {cash:.2f} 元，殖利率 {dy:.2f}%" if cash > 0 else "近一年無現金股利"
+        items.append(("現金股利殖利率", "Dividend Yield", dy > FUND_YIELD_MIN, detail, std))
+    else:
+        items.append(("現金股利殖利率", "Dividend Yield", None, "無股價資料，無法計算", std))
+
+    # 4. 每股盈餘 EPS：最新一季較去年同期成長
+    std = "EPS 持續成長代表獲利能力上升（比較最新一季與去年同期）"
+    eps_ok, eps_detail = None, "EPS 資料不足，無法判斷成長"
+    try:
+        if eps_quarterly is not None and len(eps_quarterly) >= 5:
+            cur, yoy = float(eps_quarterly.iloc[0]), float(eps_quarterly.iloc[4])
+            eps_ok = cur > yoy
+            eps_detail = f"最新一季 {cur:.2f}，去年同期 {yoy:.2f}"
+        else:
+            g = info.get("earningsQuarterlyGrowth")
+            if isinstance(g, (int, float)):
+                eps_ok = g > 0
+                eps_detail = f"Yahoo 季獲利年增率 {g * 100:+.1f}%"
+    except Exception:
+        pass
+    items.append(("每股盈餘", "EPS", eps_ok, eps_detail, std))
+
+    # 5. 股東權益報酬率 ROE
+    std = f"> {FUND_ROE_MIN:g}% 通常代表為股東創造利潤的能力優異"
+    roe = info.get("returnOnEquity")
+    if isinstance(roe, (int, float)):
+        items.append(("股東權益報酬率", "ROE", roe * 100 > FUND_ROE_MIN, f"目前 ROE {roe * 100:.2f}%", std))
+    else:
+        items.append(("股東權益報酬率", "ROE", None, "無 ROE 資料", std))
+
+    return items
+
+
+def _technical_items(d):
+    """技術面：d 為含 K、D、DIF、MACD、OSC、RSI、MA20、MA60 的日K資料表。"""
+    names = [
+        ("移動平均線", "MA"), ("隨機指標", "KD (KDJ)"), ("相對強弱指標", "RSI"),
+        ("指數平滑異同移動平均線", "MACD"), ("乖離率", "BIAS"),
+    ]
+    stds = [
+        "股價同時站上季線(60日)與年線(240日)視為中長期多頭",
+        "K > D 且 K < 80（未進入超買區）視為偏多",
+        "RSI 介於 50～70（買方占優但未過熱）視為偏多",
+        "柱狀體 OSC > 0（DIF 在 MACD 之上）視為偏多",
+        f"乖離率(20日) < {BIAS_OVERHEAT:g}%（未過熱）視為合理",
+    ]
+    if d is None or len(d) < 30:
+        return [(n, a, None, "日K資料不足", s) for (n, a), s in zip(names, stds)]
+
+    last = d.iloc[-1]
+    close = last["Close"]
+    items = []
+
+    # 1. 移動平均線
+    ma60 = last["MA60"]
+    ma240 = d["Close"].rolling(240).mean().iloc[-1]
+    if pd.isna(ma60):
+        items.append((*names[0], None, "資料不足 60 日，無法計算季線", stds[0]))
+    else:
+        a60 = close > ma60
+        if pd.isna(ma240):
+            detail = f"股價 {close:.2f}｜季線 {ma60:.2f}（{'之上' if a60 else '之下'}）｜年線資料不足，僅以季線判斷"
+            ok = a60
+        else:
+            a240 = close > ma240
+            detail = (f"股價 {close:.2f}｜季線 {ma60:.2f}（{'之上' if a60 else '之下'}）"
+                      f"｜年線 {ma240:.2f}（{'之上' if a240 else '之下'}）")
+            ok = a60 and a240
+        items.append((*names[0], bool(ok), detail, stds[0]))
+
+    # 2. KD
+    k, dd = last["K"], last["D"]
+    if pd.isna(k) or pd.isna(dd):
+        items.append((*names[1], None, "資料不足", stds[1]))
+    else:
+        zone = "，高檔超買" if k >= 80 else ("，低檔超賣" if k <= 20 else "")
+        items.append((*names[1], bool(k > dd and k < 80), f"K {k:.0f}／D {dd:.0f}{zone}", stds[1]))
+
+    # 3. RSI
+    rsi = last["RSI"]
+    if pd.isna(rsi):
+        items.append((*names[2], None, "資料不足", stds[2]))
+    else:
+        zone = "，超買" if rsi >= 70 else ("，超賣" if rsi <= 30 else "")
+        items.append((*names[2], bool(50 < rsi < 70), f"RSI(14) {rsi:.0f}{zone}", stds[2]))
+
+    # 4. MACD
+    if pd.isna(last["OSC"]):
+        items.append((*names[3], None, "資料不足", stds[3]))
+    else:
+        axis = "零軸上" if last["DIF"] > 0 else "零軸下"
+        items.append((*names[3], bool(last["OSC"] > 0),
+                      f"DIF {last['DIF']:.2f}／MACD {last['MACD']:.2f}（{axis}），柱狀體 {last['OSC']:+.2f}", stds[3]))
+
+    # 5. 乖離率（對 20 日均線）
+    ma20 = last["MA20"]
+    if pd.isna(ma20) or ma20 == 0:
+        items.append((*names[4], None, "資料不足 20 日", stds[4]))
+    else:
+        bias = (close - ma20) / ma20 * 100
+        zone = "，正乖離過大，留意回檔" if bias >= BIAS_OVERHEAT else ("，負乖離過大，留意超跌反彈" if bias <= -BIAS_OVERHEAT else "")
+        items.append((*names[4], bool(bias < BIAS_OVERHEAT), f"20日乖離率 {bias:+.2f}%{zone}", stds[4]))
+
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -1885,7 +2039,14 @@ def render_analysis(symbol_upper, time_period):
         inst_table = render_institutional(symbol_upper)
         daily_res = render_daily_analysis(symbol_upper)
         monthly_res = render_monthly_analysis(monthly_df, display_name)
-        render_beacons(beacon_slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res)
+        try:
+            fund_items = _fundamental_items(info, pe_ratio, eps_quarterly, dividends_series, latest_close)
+            tech_items = _technical_items(daily_res[2] if daily_res else None)
+        except Exception:
+            fund_items, tech_items = None, None
+        render_beacons(
+            beacon_slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res, fund_items, tech_items
+        )
         render_news(symbol_upper, display_name)
 
     except Exception as e:
