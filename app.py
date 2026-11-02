@@ -2444,7 +2444,7 @@ with tab_stock:
         result_slot.warning("⏹ 已停止搜尋。")
 
     elif not trigger:
-        result_slot.info("👋 歡迎使用股票分析儀！請在上方輸入股票代號或名稱，並點選「開始搜尋並分析」。")
+        result_slot.info("👋 請在上方輸入股票代號或名稱，並點選「開始搜尋並分析」。")
 
     elif trigger.startswith("FAILED:"):
         failed_keyword = trigger.replace("FAILED:", "", 1)
