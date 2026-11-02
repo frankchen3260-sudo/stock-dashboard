@@ -150,8 +150,14 @@ def fetch_search_name(symbol):
 # ---------------------------------------------------------------------------
 # 代號與名稱解析
 # ---------------------------------------------------------------------------
-def _names_from_isin():
-    """來源一：證交所 ISIN 頁面（用 http，避免 https 憑證驗證失敗）。"""
+@st.cache_resource
+def _industry_store():
+    """全站共用：{代號.TW: 證交所產業別}，由 ISIN 頁面順便記錄。"""
+    return {}
+
+
+def _names_from_isin(industry_store=None):
+    """來源一：證交所 ISIN 頁面（用 http，避免 https 憑證驗證失敗）。同時記錄產業別。"""
     result = {}
     for mode, suffix in ((2, ".TW"), (4, ".TWO")):
         try:
@@ -161,12 +167,16 @@ def _names_from_isin():
             )
             html = resp.content.decode("cp950", errors="ignore")
             table = pd.read_html(StringIO(html))[0]
-            for cell in table[0].astype(str):
+            for row_i, cell in enumerate(table[0].astype(str)):
                 parts = cell.split("\u3000")  # 格式：「2330　台積電」
                 if len(parts) == 2:
                     code, name = parts[0].strip(), parts[1].strip()
                     if code.isalnum() and 4 <= len(code) <= 6:
                         result[code + suffix] = name
+                        if industry_store is not None and table.shape[1] > 4:
+                            industry = str(table.iloc[row_i, 4]).strip()
+                            if industry and industry.lower() != "nan":
+                                industry_store[code + suffix] = industry
         except Exception:
             continue
     return result
@@ -199,7 +209,7 @@ def _names_from_openapi():
 def load_tw_stock_names():
     """台股 代號 → 中文名稱。全部來源都失敗時丟出例外（例外不會被快取，下次會重試）。"""
     with ThreadPoolExecutor(max_workers=2) as pool:
-        f_isin = pool.submit(_names_from_isin)
+        f_isin = pool.submit(_names_from_isin, _industry_store())
         f_api = pool.submit(_names_from_openapi)
         result = f_isin.result()
         for sym, name in f_api.result().items():
@@ -207,6 +217,12 @@ def load_tw_stock_names():
     if not result:
         raise RuntimeError("無法取得台股名稱清單")
     return result
+
+
+def get_tw_industry(symbol):
+    """證交所／櫃買的產業別（中文），例如「半導體業」。查不到回傳空字串。"""
+    get_tw_names()  # 確保清單已載入
+    return _industry_store().get(symbol, "")
 
 
 def get_tw_names():
@@ -1432,6 +1448,141 @@ def render_beacons(slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res
 
 
 # ---------------------------------------------------------------------------
+# 行業別
+# ---------------------------------------------------------------------------
+SECTOR_ZH = {
+    "Technology": "科技",
+    "Financial Services": "金融服務",
+    "Healthcare": "醫療保健",
+    "Consumer Cyclical": "循環性消費",
+    "Consumer Defensive": "防禦性消費",
+    "Industrials": "工業",
+    "Basic Materials": "基礎材料",
+    "Energy": "能源",
+    "Utilities": "公用事業",
+    "Real Estate": "房地產",
+    "Communication Services": "通訊服務",
+}
+
+
+# 細分行業標籤：代號 → 標籤（以「、」分隔）。這是程式內建的對照表，可自行增修；未收錄的股票會改用 Yahoo / 證交所分類。
+INDUSTRY_TAGS = {
+    # --- 半導體：IC設計 ---
+    "2454": "IC設計、半導體", "3034": "IC設計、半導體", "2379": "IC設計、半導體", "3035": "IC設計、半導體",
+    "3443": "IC設計、半導體", "6533": "IC設計、半導體", "4966": "IC設計、半導體", "5269": "IC設計、半導體",
+    "6415": "IC設計、半導體", "3529": "IC設計、半導體", "8299": "IC設計、記憶體", "2458": "IC設計、半導體",
+    "3014": "IC設計、半導體", "6756": "IC設計、半導體", "3227": "IC設計、半導體", "5274": "IC設計、半導體",
+    "4961": "IC設計、半導體", "6643": "IC設計、半導體", "3661": "IC設計、半導體", "2436": "IC設計、半導體",
+    "8016": "IC設計、半導體", "6202": "IC設計、半導體", "4919": "IC設計、半導體", "2401": "IC設計、半導體",
+    "3006": "IC設計、記憶體",
+    # --- 半導體：晶圓代工 ---
+    "2330": "晶圓代工、半導體", "2303": "晶圓代工、半導體", "6770": "晶圓代工、半導體", "5347": "晶圓代工、半導體",
+    # --- 半導體：封裝測試 ---
+    "3711": "封裝測試、半導體", "2449": "封裝測試、半導體", "6239": "封裝測試、半導體", "8150": "封裝測試、半導體",
+    "6257": "封裝測試、半導體", "2441": "封裝測試、半導體", "6147": "封裝測試、半導體", "3264": "封裝測試、半導體",
+    "3374": "封裝測試、半導體", "2369": "封裝測試、半導體",
+    # --- 半導體：設備、材料、廠務 ---
+    "3680": "半導體設備", "3131": "半導體設備", "3583": "半導體設備", "6196": "半導體設備、廠務工程",
+    "2404": "半導體廠務工程", "3413": "半導體設備", "2360": "半導體測試設備", "6187": "封裝設備、PCB設備",
+    "3030": "測試設備、PCB設備", "3167": "PCB設備、半導體設備",
+    "1560": "半導體材料", "3532": "半導體材料", "6488": "半導體材料（矽晶圓）", "5483": "半導體材料（矽晶圓）",
+    "3016": "半導體材料、功率半導體",
+    # --- 記憶體、功率半導體 ---
+    "2408": "記憶體、半導體", "2337": "記憶體、半導體", "3260": "記憶體模組", "4967": "記憶體模組", "5351": "記憶體、IC設計",
+    "2481": "功率半導體", "5425": "功率半導體", "8261": "功率半導體",
+    # --- PCB 相關產業 ---
+    "3037": "PCB相關產業、ABF載板", "8046": "PCB相關產業、ABF載板", "3189": "PCB相關產業、ABF載板",
+    "2313": "PCB相關產業", "3044": "PCB相關產業", "2368": "PCB相關產業", "4958": "PCB相關產業",
+    "5469": "PCB相關產業", "8213": "PCB相關產業", "2316": "PCB相關產業", "6191": "PCB相關產業",
+    "2383": "PCB相關產業、銅箔基板", "6213": "PCB相關產業、銅箔基板", "6274": "PCB相關產業、銅箔基板",
+    "6672": "PCB相關產業、銅箔基板", "1815": "PCB相關產業、玻纖布",
+    "6153": "PCB相關產業、軟板", "6269": "PCB相關產業、軟板", "2355": "PCB相關產業", "8021": "PCB相關產業、鑽針",
+    # --- 電子代工、伺服器、散熱、電源 ---
+    "2317": "電子代工、AI伺服器", "2382": "AI伺服器、電腦代工", "3231": "AI伺服器、電腦代工", "6669": "AI伺服器",
+    "2356": "AI伺服器、電腦代工", "2376": "伺服器、主機板", "2377": "伺服器、主機板", "3706": "伺服器",
+    "2324": "電腦代工", "4938": "電子代工", "2357": "電腦品牌", "2353": "電腦品牌",
+    "2308": "電源供應、散熱", "2301": "電源供應、光電", "3017": "散熱", "3324": "散熱", "3653": "散熱", "6230": "散熱",
+    # --- 網通、光通訊 ---
+    "2345": "網通設備", "5388": "網通設備", "2332": "網通設備", "3596": "網通設備", "4906": "網通設備",
+    "6285": "網通設備", "3380": "網通設備",
+    "4979": "光通訊", "3363": "光通訊", "4977": "光通訊", "3450": "光通訊", "4908": "光通訊", "6442": "光通訊", "3081": "光通訊",
+    # --- 被動元件、連接器、光學、面板 ---
+    "2327": "被動元件", "2492": "被動元件", "3026": "被動元件", "6173": "被動元件", "2375": "被動元件",
+    "3533": "連接器", "3023": "連接器、線束", "2392": "連接器", "6197": "連接器",
+    "3008": "光學鏡頭", "3406": "光學鏡頭", "2409": "面板", "3481": "面板",
+    # --- 航運、鋼鐵、塑化、水泥、食品、電信 ---
+    "2603": "航運", "2609": "航運", "2615": "航運", "2605": "航運", "2606": "航運",
+    "2002": "鋼鐵", "2014": "鋼鐵", "2027": "鋼鐵",
+    "1301": "塑化", "1303": "塑化", "1326": "塑化", "6505": "塑化",
+    "1101": "水泥", "1102": "水泥", "1216": "食品",
+    "2412": "電信", "3045": "電信", "4904": "電信",
+    # --- 金融 ---
+    "2881": "金控", "2882": "金控", "2891": "金控", "2886": "金控", "2884": "金控", "2880": "金控",
+    "2885": "金控", "2887": "金控", "2890": "金控", "2892": "金控", "5880": "金控", "2883": "金控",
+    "2812": "銀行", "2801": "銀行", "2834": "銀行", "2845": "銀行",
+    # --- 汽車、生技、ETF ---
+    "2201": "汽車", "1319": "汽車零組件", "1536": "汽車零組件",
+    "6446": "生技醫療", "4743": "生技醫療", "6547": "生技醫療",
+    "0050": "ETF（台灣50）", "0056": "ETF（高股息）", "00878": "ETF（高股息）", "00919": "ETF（高股息）",
+    "00929": "ETF（高股息）", "00881": "ETF（科技）",
+}
+
+# Yahoo 的細分行業（英文）→ 中文，供未收錄股票使用
+YAHOO_INDUSTRY_ZH = {
+    "Semiconductors": "半導體",
+    "Semiconductor Equipment & Materials": "半導體設備與材料",
+    "Electronic Components": "電子零組件",
+    "Computer Hardware": "電腦硬體",
+    "Consumer Electronics": "消費電子",
+    "Communication Equipment": "通訊設備",
+    "Electronics & Computer Distribution": "電子通路",
+    "Scientific & Technical Instruments": "儀器設備",
+    "Electrical Equipment & Parts": "電機設備",
+    "Solar": "太陽能",
+    "Auto Parts": "汽車零組件",
+    "Auto Manufacturers": "汽車",
+    "Steel": "鋼鐵",
+    "Banks - Regional": "銀行",
+    "Insurance - Life": "保險",
+    "Asset Management": "資產管理",
+    "Marine Shipping": "航運",
+    "Airlines": "航空",
+    "Biotechnology": "生技",
+    "Drug Manufacturers - Specialty & Generic": "製藥",
+    "Medical Devices": "醫療器材",
+    "Packaged Foods": "食品",
+    "Specialty Chemicals": "特用化學",
+    "Chemicals": "化學",
+    "Textile Manufacturing": "紡織",
+    "Building Materials": "建材",
+    "Telecom Services": "電信",
+    "Real Estate - Development": "建設",
+    "Engineering & Construction": "營建工程",
+    "Software - Application": "軟體",
+    "Information Technology Services": "資訊服務",
+    "Display & Optics": "光電",
+}
+
+
+def render_company_intro(symbol, info, display_name):
+    """一行顯示行業別（細分行業標籤）。標籤優先用內建對照表，其次 Yahoo 細分行業，最後才是證交所／Yahoo 大類。"""
+    code = symbol.split(".")[0]
+    sector_zh = SECTOR_ZH.get(info.get("sector") or "", info.get("sector") or "")
+    try:
+        tw_industry = get_tw_industry(symbol)
+    except Exception:
+        tw_industry = ""
+
+    main = INDUSTRY_TAGS.get(code) or YAHOO_INDUSTRY_ZH.get(info.get("industry") or "", "")
+    broad = tw_industry or sector_zh
+    if main and broad and broad not in main:
+        text = f"{main}（{broad}）"
+    else:
+        text = main or broad or "查無資料"
+    st.markdown(f"🏢 **行業別**：{text}")
+
+
+# ---------------------------------------------------------------------------
 # 頁面設定與 Session State
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="股票分析", layout="wide")
@@ -1656,6 +1807,7 @@ def render_analysis(symbol_upper, time_period):
 
         # --- 渲染 ---
         st.subheader(f"📊 {display_name} ({symbol_upper}) 分析結果")
+        render_company_intro(symbol_upper, info, display_name)
         beacon_slot = st.empty()
         beacon_slot.info("🚦 購買指標燈號計算中…")
         render_live_quote(symbol_upper)
