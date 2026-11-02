@@ -23,6 +23,9 @@ STOCK_ZH_DICT = {
     "2812.TW": "台中銀",
     "00881.TW": "國泰台灣科技龍頭",
 }
+# 分析用的歷史資料區間（固定近 1 年）
+TIME_PERIOD = "1y"
+
 # 反向字典（中文名稱 → 代號），讓使用者可以直接輸入中文
 ZH_TO_TICKER = {name: sym for sym, name in STOCK_ZH_DICT.items()}
 
@@ -66,7 +69,7 @@ def show_chart(fig, height=None):
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_history(symbol, period):
-    """只抓日K價格（快）。切換時間區間時只會重抓這一項。"""
+    """只抓日K價格（快）。"""
     return yf.Ticker(symbol).history(period=period)
 
 
@@ -116,7 +119,7 @@ def _load_monthly(symbol):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_fundamentals(symbol):
-    """基本面、股利、EPS、月K：用多執行緒同時抓，只跟股票代號有關（與時間區間無關）。"""
+    """基本面、股利、EPS、月K：用多執行緒同時抓，只跟股票代號有關。"""
     with ThreadPoolExecutor(max_workers=5) as pool:
         f_info = pool.submit(_load_info, symbol)
         f_div = pool.submit(_load_dividends, symbol)
@@ -1020,7 +1023,7 @@ def render_daily_analysis(symbol):
     st.subheader("📈 日K線趨勢分析")
 
     try:
-        daily = fetch_history(symbol, "1y")  # 固定用近一年資料，不受上方時間區間影響
+        daily = fetch_history(symbol, "1y")  # 固定用近一年資料
     except Exception as e:
         st.warning(f"⚠️ 目前無法取得日K資料：{e}")
         return
@@ -1065,7 +1068,7 @@ def render_daily_analysis(symbol):
         "僅供參考，不構成投資建議。"
     )
 
-    return signals, total
+    return signals, total, d
 
 
 # ---------------------------------------------------------------------------
@@ -1366,7 +1369,42 @@ def _beacon_items(pe_ratio, eps_last4, inst_table, daily_res, monthly_res):
             bull = sum(1 for _, _, sc in signals if sc > 0)
             bear = sum(1 for _, _, sc in signals if sc < 0)
             items.append((name, bull > bear, f"偏多 {bull} 項、偏空 {bear} 項"))
+
+    # 8. 近期突破 / 跌破月線（日K的 20 日均線）：站上月線亮紅燈、跌破月線亮綠燈
+    name = "近期突破／跌破月線"
+    items.append((name, *_ma20_cross_state(daily_res)))
     return items
+
+
+def _ma20_cross_state(daily_res):
+    """回傳 (狀態, 說明)。狀態：True=站上月線（含近期往上突破）、False=跌破月線（含近期往下跌破）、None=資料不足。"""
+    if daily_res is None or len(daily_res) < 3:
+        return None, "日K資料不足，無法判斷月線"
+    d = daily_res[2]
+    valid = d["Close"].notna() & d["MA20"].notna()
+    d = d[valid]
+    if len(d) < 3:
+        return None, "資料不足，無法計算月線"
+
+    above = (d["Close"] > d["MA20"]).tolist()
+    recent = above[-6:]  # 今天加上前 5 個交易日
+    now = recent[-1]
+    gap = (d["Close"].iloc[-1] - d["MA20"].iloc[-1]) / d["MA20"].iloc[-1] * 100
+
+    cross_at = None  # 最近一次站在「相反側」的位置
+    for i in range(len(recent) - 2, -1, -1):
+        if recent[i] != now:
+            cross_at = i
+            break
+
+    if cross_at is None:
+        side = "站在月線之上" if now else "在月線之下"
+        return now, f"近 5 日持續{side}（距月線 {gap:+.1f}%）"
+    days_ago = len(recent) - 2 - cross_at
+    when = "今日" if days_ago == 0 else f"{days_ago} 個交易日前"
+    if now:
+        return True, f"{when}由下往上突破月線（距月線 {gap:+.1f}%）"
+    return False, f"{when}由上往下跌破月線（距月線 {gap:+.1f}%）"
 
 
 def render_beacons(slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res):
@@ -1388,7 +1426,7 @@ def render_beacons(slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res
         st.caption(
             f"目前達到 **{hit} / {len(valid)}** 項（資料不足的項目不計入）。"
             "🔴 紅燈＝達到條件　🟢 綠燈＝未達到　⚪ 白燈＝資料不足。"
-            "外資、投信、自營商各自從最新一天往回數連續買超天數；日K、月K以趨勢分析中偏多訊號數與偏空訊號數比較。"
+            "外資、投信、自營商各自從最新一天往回數連續買超天數；日K、月K以趨勢分析中偏多訊號數與偏空訊號數比較；月線指日K的 20 日均線，股價在月線之上亮紅燈、之下亮綠燈。"
             "僅為條件檢查，不構成投資建議。"
         )
 
@@ -1396,8 +1434,8 @@ def render_beacons(slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res
 # ---------------------------------------------------------------------------
 # 頁面設定與 Session State
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="股票分析", layout="wide")
-st.title("📈 股票分析")
+st.set_page_config(page_title="簡易股票分析儀", layout="wide")
+st.title("📈 智慧股票分析儀表板")
 
 # 重新執行時 Streamlit 會把舊內容變淡（反白），這段 CSS 讓畫面維持原樣
 st.markdown(
@@ -1493,7 +1531,7 @@ def run_search(user_keyword):
     valid_symbol = None
     for cand in candidates:
         try:
-            if not fetch_history(cand, st.session_state.get("time_period", "1y")).empty:
+            if not fetch_history(cand, TIME_PERIOD).empty:
                 valid_symbol = cand
                 break
         except Exception:
@@ -1525,7 +1563,7 @@ def render_analysis(symbol_upper, time_period):
             )
 
         if df is None or len(df) < 2:
-            st.warning("⚠️ 此區間內的歷史資料不足（少於 2 筆），請改選較長的時間區間。")
+            st.warning("⚠️ 近一年的歷史資料不足（少於 2 筆），可能是剛上市的股票，無法進行分析。")
             return
 
         display_name = st.session_state.current_name or resolve_display_name(
@@ -1709,17 +1747,13 @@ def render_analysis(symbol_upper, time_period):
 # ---------------------------------------------------------------------------
 mobile = is_mobile()
 if mobile:
-    # 手機：輸入框、區間、按鈕由上而下全寬排列
-    in_col = period_col = btn_col = st.container()
+    # 手機：輸入框與按鈕由上而下全寬排列
+    in_col = btn_col = st.container()
 else:
-    in_col, period_col, btn_col, _spacer = st.columns([3, 1.5, 1.5, 4], vertical_alignment="bottom")
+    in_col, btn_col, _spacer = st.columns([3, 1.5, 5], vertical_alignment="bottom")
 
 with in_col:
     st.text_input("請輸入股票代號或中文名稱：", key="input_val")
-with period_col:
-    time_period = st.selectbox(
-        "選擇時間區間", ["1mo", "3mo", "6mo", "1y", "5y"], index=3, key="time_period"
-    )
 with btn_col:
     st.button(
         "🔍 開始搜尋並分析",
@@ -1727,6 +1761,8 @@ with btn_col:
         on_click=handle_search_button_click,
         width="stretch" if mobile else "content",
     )
+
+time_period = TIME_PERIOD  # 固定為近 1 年
 
 
 # ---------------------------------------------------------------------------
