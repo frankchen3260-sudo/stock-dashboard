@@ -1,5 +1,6 @@
 import datetime
 import os
+import time
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +32,33 @@ ENGLISH_OVERRIDES = {
     "COMPEQ": "華通",
     "CATHAY": "國泰台灣科技龍頭",
 }
+
+
+# ---------------------------------------------------------------------------
+# 手機版排版輔助
+# ---------------------------------------------------------------------------
+def is_mobile():
+    """依瀏覽器 User-Agent 判斷是否為手機（平板視為桌機排版）。"""
+    try:
+        ua = st.context.headers.get("User-Agent", "")
+    except Exception:
+        return False
+    return "Mobile" in ua or "iPhone" in ua
+
+
+def show_chart(fig):
+    """統一圖表外觀；手機版縮小高度、圖例放下方，並關閉拖曳縮放，避免手指滑頁面時被圖表搶走。"""
+    mobile = is_mobile()
+    fig.update_layout(
+        margin=dict(l=8, r=8, t=48, b=48),
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="left", x=0),
+        height=380 if mobile else 520,
+    )
+    if mobile:
+        fig.update_layout(title=dict(font=dict(size=15)))
+        fig.update_xaxes(title=None, fixedrange=True)
+        fig.update_yaxes(title=None, fixedrange=True)
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": not mobile})
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +472,7 @@ def render_institutional(symbol):
         yaxis_title="買賣超（張）",
         xaxis_type="category",
     )
-    st.plotly_chart(fig_i, width="stretch")
+    show_chart(fig_i)
 
     # --- 明細表（新 → 舊），紅＝買超、綠＝賣超 ---
     shown = table.sort_index(ascending=False)
@@ -655,7 +683,7 @@ def render_monthly_analysis(monthly, display_name):
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
     )
-    st.plotly_chart(fig_m, width="stretch")
+    show_chart(fig_m)
 
     st.caption(
         "📌 最後一根為本月（尚未收盤）的資料，訊號可能隨月底收盤改變。"
@@ -954,9 +982,169 @@ def render_news(symbol, display_name):
 
 
 # ---------------------------------------------------------------------------
+# 即時報價（台股：證交所 MIS 即時行情，約每 5 秒更新；其他：Yahoo，可能延遲）
+# ---------------------------------------------------------------------------
+def is_market_open():
+    """台股交易時間：週一至週五 09:00–13:30（含收盤試撮緩衝）。不含國定假日判斷。"""
+    now = datetime.datetime.now(TW_TZ)
+    return now.weekday() < 5 and datetime.time(8, 55) <= now.time() <= datetime.time(13, 35)
+
+
+def _to_float(x):
+    try:
+        return float(str(x).replace(",", ""))
+    except Exception:
+        return None
+
+
+def _first_price(text):
+    """五檔報價字串「123.0_122.5_...」取第一個有效價格。"""
+    for part in str(text or "").split("_"):
+        v = _to_float(part)
+        if v:
+            return v
+    return None
+
+
+def _fmt_mis_time(d, t):
+    d = str(d)
+    if len(d) == 8 and d.isdigit():
+        d = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    return f"{d} {t}".strip()
+
+
+def _parse_mis(item):
+    last = _to_float(item.get("z"))
+    bid, ask = _first_price(item.get("b")), _first_price(item.get("a"))
+    note = ""
+    if last is None:  # 尚無成交（例如剛開盤）：用最佳買賣價中間值當參考
+        if bid and ask:
+            last, note = (bid + ask) / 2, "尚無成交，顯示買賣價中間值"
+        else:
+            last = bid or ask
+            note = "尚無成交，顯示最佳委買或委賣價" if last else ""
+    prev = _to_float(item.get("y"))
+    return {
+        "price": last,
+        "prev_close": prev,
+        "open": _to_float(item.get("o")),
+        "high": _to_float(item.get("h")),
+        "low": _to_float(item.get("l")),
+        "volume": _to_float(item.get("v")),  # 累計成交量（張）
+        "time": _fmt_mis_time(item.get("d", ""), item.get("t", "")),
+        "source": "臺灣證交所即時行情",
+        "note": note,
+    }
+
+
+@st.cache_resource(ttl=600, show_spinner=False)
+def _mis_session():
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/stock/index.jsp"})
+    try:
+        sess.get("https://mis.twse.com.tw/stock/index.jsp", timeout=5)  # 取得 cookie
+    except Exception:
+        pass
+    return sess
+
+
+def _quote_from_mis(symbol):
+    prefix = "otc" if symbol.endswith(".TWO") else "tse"
+    ex_ch = f"{prefix}_{symbol.split('.')[0].lower()}.tw"
+    resp = _mis_session().get(
+        "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+        params={"ex_ch": ex_ch, "json": "1", "delay": "0", "_": int(time.time() * 1000)},
+        timeout=6,
+    )
+    resp.raise_for_status()
+    arr = resp.json().get("msgArray") or []
+    if not arr:
+        raise RuntimeError("證交所即時行情查無此代號")
+    q = _parse_mis(arr[0])
+    if q["price"] is None:
+        raise RuntimeError("證交所即時行情尚無報價")
+    return q
+
+
+def _quote_from_yahoo(symbol):
+    fi = yf.Ticker(symbol).fast_info
+    price = fi.get("last_price")
+    if price is None:
+        raise RuntimeError("Yahoo 無即時報價")
+    vol = fi.get("last_volume")
+    is_tw = symbol.endswith((".TW", ".TWO"))
+    return {
+        "price": float(price),
+        "prev_close": fi.get("previous_close"),
+        "open": fi.get("open"),
+        "high": fi.get("day_high"),
+        "low": fi.get("day_low"),
+        "volume": (vol / 1000 if is_tw else vol) if vol else None,
+        "time": datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "Yahoo Finance（可能延遲約 15–20 分鐘）",
+        "note": "",
+    }
+
+
+@st.cache_data(ttl=4, show_spinner=False)
+def fetch_realtime_quote(symbol):
+    """短暫快取 4 秒：多位使用者同時看同一檔時共用結果，減少對來源的請求。失敗會丟出例外。"""
+    if symbol.endswith((".TW", ".TWO")):
+        try:
+            return _quote_from_mis(symbol)
+        except Exception:
+            pass  # 證交所失敗就退回 Yahoo
+    return _quote_from_yahoo(symbol)
+
+
+def _fmt(v, nd=2):
+    return f"{v:,.{nd}f}" if isinstance(v, (int, float)) else "N/A"
+
+
+def _live_quote_body(symbol):
+    try:
+        q = fetch_realtime_quote(symbol)
+    except Exception as e:
+        st.warning(f"⚠️ 目前無法取得即時報價：{e}")
+        return
+
+    cols = st.columns(5)
+    price, prev = q["price"], q["prev_close"]
+    if isinstance(prev, (int, float)) and prev:
+        chg = price - prev
+        delta = f"{chg:+.2f} ({chg / prev * 100:+.2f}%)"
+    else:
+        delta = None
+    cols[0].metric("成交價", _fmt(price), delta, delta_color="inverse")  # 台股：紅漲綠跌
+    cols[1].metric("開盤", _fmt(q["open"]))
+    cols[2].metric("最高", _fmt(q["high"]))
+    cols[3].metric("最低", _fmt(q["low"]))
+    cols[4].metric("累計成交量", f"{q['volume']:,.0f} 張" if q["volume"] else "N/A")
+    extra = f"　昨收 {_fmt(prev)}" if prev else ""
+    note = f"　（{q['note']}）" if q["note"] else ""
+    st.caption(f"⚡ 資料時間 {q['time']}　來源：{q['source']}{extra}{note}")
+
+
+# 同一個函式做成兩種版本：交易時間每 5 秒自動更新，其餘時間只在載入時更新一次
+live_quote_auto = st.fragment(run_every=5)(_live_quote_body)
+live_quote_static = st.fragment(_live_quote_body)
+
+
+def render_live_quote(symbol):
+    st.markdown("##### ⚡ 即時報價")
+    st.toggle("🔄 交易時間自動更新（每 5 秒）", value=True, key="auto_refresh")
+    if st.session_state.get("auto_refresh", True) and is_market_open():
+        live_quote_auto(symbol)
+    else:
+        live_quote_static(symbol)
+        if not is_market_open():
+            st.caption("目前非交易時間，顯示最近一次成交資料。")
+
+
+# ---------------------------------------------------------------------------
 # 頁面設定與 Session State
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="簡易股票分析儀", layout="wide")
+st.set_page_config(page_title="股票分析", layout="wide")
 st.title("📈 股票分析")
 
 # 重新執行時 Streamlit 會把舊內容變淡（反白），這段 CSS 讓畫面維持原樣
@@ -968,6 +1156,32 @@ st.markdown(
         max-width: 1150px;
         margin-left: auto;
         margin-right: auto;
+    }
+
+    /* 手機版：縮小邊距與字級、欄位改成每列 2 個、底部留白避免被平台徽章遮住 */
+    @media (max-width: 640px) {
+        .block-container, [data-testid="stMainBlockContainer"] {
+            padding: 2.2rem 0.8rem 5rem 0.8rem !important;
+        }
+        h1 { font-size: 1.6rem !important; line-height: 1.3 !important; }
+        h2, h3 { font-size: 1.2rem !important; }
+        [data-testid="stMain"] [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+            gap: 0.5rem 0.75rem !important;
+        }
+        [data-testid="stMain"] [data-testid="stColumn"] {
+            min-width: calc(50% - 0.5rem) !important;
+            flex: 1 1 calc(50% - 0.5rem) !important;
+            width: calc(50% - 0.5rem) !important;
+        }
+        [data-testid="stMetricValue"] { font-size: 1.4rem !important; }
+        [data-testid="stMetricLabel"], [data-testid="stMetricLabel"] * {
+            font-size: 0.8rem !important;
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+        }
+        [data-testid="stMetricDelta"] { font-size: 0.75rem !important; }
     }
     </style>
     """,
@@ -1151,12 +1365,13 @@ def render_analysis(symbol_upper, time_period):
 
         # --- 渲染 ---
         st.subheader(f"📊 {display_name} ({symbol_upper}) 分析結果")
+        render_live_quote(symbol_upper)
         getattr(st, diag_level)(diagnostic_msg)
 
         # 第一列：價格相關
         r1c1, r1c2, r1c3, r1c4 = st.columns(4)
         r1c1.metric(
-            "最新收盤價",
+            "日K最新價 (Yahoo)",
             f"{latest_close:.2f}",
             f"{change:+.2f} ({change_pct:+.2f}%)",
             delta_color="inverse",  # 台股慣例：紅漲綠跌
@@ -1184,7 +1399,7 @@ def render_analysis(symbol_upper, time_period):
 
         # 近四季 EPS 明細
         if len(eps_last4) > 0:
-            with st.columns([1, 1])[0]:
+            with (st.container() if is_mobile() else st.columns([1, 1])[0]):
                 with st.expander("📋 近四季 EPS 明細"):
                     eps_table = pd.DataFrame(
                         {
@@ -1220,7 +1435,7 @@ def render_analysis(symbol_upper, time_period):
             template="plotly_dark",
             xaxis_rangeslider_visible=False,
         )
-        st.plotly_chart(fig, width="stretch")
+        show_chart(fig)
 
         render_institutional(symbol_upper)
         render_daily_analysis(symbol_upper)
@@ -1234,7 +1449,13 @@ def render_analysis(symbol_upper, time_period):
 # ---------------------------------------------------------------------------
 # 主畫面：輸入區
 # ---------------------------------------------------------------------------
-in_col, period_col, btn_col, _spacer = st.columns([3, 1.5, 1.5, 4], vertical_alignment="bottom")
+mobile = is_mobile()
+if mobile:
+    # 手機：輸入框、區間、按鈕由上而下全寬排列
+    in_col = period_col = btn_col = st.container()
+else:
+    in_col, period_col, btn_col, _spacer = st.columns([3, 1.5, 1.5, 4], vertical_alignment="bottom")
+
 with in_col:
     st.text_input("請輸入股票代號或中文名稱：", key="input_val")
 with period_col:
@@ -1246,6 +1467,7 @@ with btn_col:
         "🔍 開始搜尋並分析",
         type="primary",
         on_click=handle_search_button_click,
+        width="stretch" if mobile else "content",
     )
 
 
