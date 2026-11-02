@@ -1535,8 +1535,15 @@ def _technical_items(d):
         ("指數平滑異同移動平均線", "MACD"), ("乖離率", "BIAS"),
     ]
     stds = [
-        "股價同時站上季線(60日)與年線(240日)視為中長期多頭",
-        "K > D 且 K < 80（未進入超買區）視為偏多",
+        "紅燈：股價同時站上季線(60日)與年線(240日)視為中長期多頭。\n\n"
+        "• 多頭排列（極佳，全面作多訊號）｜20MA > 60MA > 240MA 且均線同步勾頭向上：無論長短線投資人都在賺錢，是市場最強烈、最健康的「好趨勢」，應順勢做多。\n\n"
+        "• 空頭排列（極壞，絕對觀望/放空訊號）｜240MA > 60MA > 20MA 且均線全面勾頭向下：市場上套牢賣壓沉重，走勢極「壞」，千萬不可盲目攤平接刀。\n\n"
+        "• 黃金交叉（好訊號）｜短天期均線由下往上突破長天期均線（例如 20MA 突破 60MA）：短期買盤力道超越長期平均，中長期波段極大機率即將啟動上漲。\n\n"
+        "• 死亡交叉（壞訊號）｜短天期均線由上往下跌破長天期均線（例如 20MA 跌破 60MA）：短期持股成本快速跌破長期平均，多頭行情結束，可能迎來深度的崩盤或回檔。",
+        "紅燈：K > D 且 K < 80（未進入超買區）視為偏多。\n\n"
+        "• 80 以上｜超買區（短線過熱）：短期內買方力道極強，通常暗示股價面臨追高風險，隨時可能拉回修正，屬於短線需提高警覺的「壞」位置。\n\n"
+        "• 20～80｜多空平衡區：股價處於正常波動範圍，此時以順勢操作或參考交叉訊號為主。\n\n"
+        "• 20 以下｜超賣區（短線過冷）：短期內股價被過度拋售，代表賣壓可能已經竭盡，隨時容易觸底反彈，屬於值得留意買點的「好」機會。",
         "紅燈：RSI 落在 52～70「多頭強勢」區（買方占優但未過熱）。\n\n"
         "• 70 以上｜超買區（過熱）：買方力道極強，但接近 80 需警惕追高風險，短期可能高檔折返或修正。\n\n"
         "• 50～70｜多頭強勢：買方大於賣方，多方控盤，屬穩健上漲趨勢，走勢相對偏好。\n\n"
@@ -1548,7 +1555,10 @@ def _technical_items(d):
         "• 快慢線在 0 軸之下｜絕對空頭市場：走勢偏壞，宜觀望或做空為主，反彈往往是強弩之末。\n\n"
         "• 柱狀體由綠翻紅（由負變正）｜買方動能增強：下跌力道減弱、上漲動能開始爆發，屬於波段「轉好」的起點。\n\n"
         "• 柱狀體由紅翻綠（由正變負）｜賣方動壓湧現：上漲力道竭盡、下跌動能開始增強，屬於波段「轉壞」的起點。",
-        f"乖離率(20日) < {BIAS_OVERHEAT:g}%（未過熱）視為合理",
+        f"紅燈：乖離率(20日) < {BIAS_OVERHEAT:g}%（未過熱）視為合理。\n\n"
+        f"• 正乖離過大（≥ {BIAS_OVERHEAT:g}%）｜短線超買、嚴重過熱：股價遠高於市場平均成本，短線獲利賣壓極重，隨時可能拉回修正，屬於追高風險極大的「壞」位置。\n\n"
+        "• 接近 0% 附近｜多空成本平衡：股價貼近均線。多頭市場中，常是拉回均線有撐的「好買點」；空頭市場中，則是反彈遭遇均線壓力的「反轉點」。\n\n"
+        f"• 負乖離過大（≤ -{BIAS_OVERHEAT:g}%）｜短線超賣、跌深恐慌：股價遠低於市場平均成本，市場陷入非理性拋售，但也暗示隨時會出現強烈反彈，是左側交易者尋找潛在「好買點」的觀察區。",
     ]
     if d is None or len(d) < 30:
         return [(n, a, None, "日K資料不足", s) for (n, a), s in zip(names, stds)]
@@ -1557,9 +1567,10 @@ def _technical_items(d):
     close = last["Close"]
     items = []
 
-    # 1. 移動平均線
+    # 1. 移動平均線：排列 + 方向 + 20/60 黃金/死亡交叉
     ma60 = last["MA60"]
-    ma240 = d["Close"].rolling(240).mean().iloc[-1]
+    ma240_s = d["Close"].rolling(240).mean()
+    ma240 = ma240_s.iloc[-1]
     if pd.isna(ma60):
         items.append((*names[0], None, "資料不足 60 日，無法計算季線", stds[0]))
     else:
@@ -1572,15 +1583,90 @@ def _technical_items(d):
             detail = (f"股價 {close:.2f}｜季線 {ma60:.2f}（{'之上' if a60 else '之下'}）"
                       f"｜年線 {ma240:.2f}（{'之上' if a240 else '之下'}）")
             ok = a60 and a240
-        items.append((*names[0], bool(ok), detail, stds[0]))
 
-    # 2. KD
+        ma20_v = last["MA20"]
+        ma20_s, ma60_s = d["MA20"], d["MA60"]
+
+        def _slope(series, n=5):
+            """近 n 日均線方向：1 上揚、-1 下彎、0 走平"""
+            sr = series.dropna()
+            if len(sr) <= n or sr.iloc[-n - 1] == 0:
+                return 0
+            chg = (sr.iloc[-1] - sr.iloc[-n - 1]) / sr.iloc[-n - 1] * 100
+            return 1 if chg > 0.1 else (-1 if chg < -0.1 else 0)
+
+        # 排列（有年線用 20/60/240，否則退而用 20/60）
+        up_all = down_all = False
+        if not pd.isna(ma20_v):
+            if not pd.isna(ma240):
+                chain = [ma20_v, ma60, ma240]
+                slopes = [_slope(ma20_s), _slope(ma60_s), _slope(ma240_s)]
+                label = "20MA > 60MA > 240MA"
+                label_r = "240MA > 60MA > 20MA"
+            else:
+                chain = [ma20_v, ma60]
+                slopes = [_slope(ma20_s), _slope(ma60_s)]
+                label = "20MA > 60MA"
+                label_r = "60MA > 20MA"
+            bull = all(chain[x] > chain[x + 1] for x in range(len(chain) - 1))
+            bear = all(chain[x] < chain[x + 1] for x in range(len(chain) - 1))
+            up_all = bull and all(sl > 0 for sl in slopes)
+            down_all = bear and all(sl < 0 for sl in slopes)
+            if up_all:
+                arr = f"多頭排列（{label}，均線同步勾頭向上）＝全面作多訊號：無論長短線投資人都在賺錢，是最強烈、最健康的好趨勢，宜順勢做多"
+            elif down_all:
+                arr = f"空頭排列（{label_r}，均線全面勾頭向下）＝絕對觀望/放空訊號：套牢賣壓沉重，走勢極壞，不可盲目攤平接刀"
+            elif bull:
+                arr = f"均線呈多頭排列（{label}），但尚有均線未同步向上，強度待確認"
+            elif bear:
+                arr = f"均線呈空頭排列（{label_r}），但尚有均線未同步向下，仍偏弱勢"
+            else:
+                arr = "均線糾結、排列不明確＝盤整格局，方向待選擇"
+        else:
+            arr = "資料不足，無法判斷均線排列"
+
+        # 近 5 個交易日內的 20MA / 60MA 交叉
+        cross = ""
+        diff = (ma20_s - ma60_s).dropna().tail(6)
+        if len(diff) >= 2:
+            sg = [1 if v > 0 else (-1 if v < 0 else 0) for v in diff]
+            for x in range(len(sg) - 1, 0, -1):
+                if sg[x] > 0 and sg[x - 1] <= 0:
+                    cross = "近期出現黃金交叉（20MA 由下往上突破 60MA）＝短期買盤力道超越長期平均，中長期波段極大機率即將啟動上漲"
+                    break
+                if sg[x] < 0 and sg[x - 1] >= 0:
+                    cross = "近期出現死亡交叉（20MA 由上往下跌破 60MA）＝短期持股成本快速跌破長期平均，多頭行情結束，可能迎來深度崩盤或回檔"
+                    break
+        if not cross:
+            cross = "近 5 日無 20MA／60MA 交叉"
+
+        items.append((*names[0], bool(ok), f"{detail}｜{arr}｜{cross}", stds[0]))
+
+    # 2. KD：依數值區間對照市場含意與操作邏輯 + 黃金/死亡交叉
     k, dd = last["K"], last["D"]
     if pd.isna(k) or pd.isna(dd):
         items.append((*names[1], None, "資料不足", stds[1]))
     else:
-        zone = "，高檔超買" if k >= 80 else ("，低檔超賣" if k <= 20 else "")
-        items.append((*names[1], bool(k > dd and k < 80), f"K {k:.0f}／D {dd:.0f}{zone}", stds[1]))
+        if k >= 80:
+            zone, logic = "超買區（短線過熱）", "短期內買方力道極強，通常暗示股價面臨追高風險，隨時可能拉回修正，屬於短線需提高警覺的壞位置"
+        elif k <= 20:
+            zone, logic = "超賣區（短線過冷）", "短期內股價被過度拋售，賣壓可能已經竭盡，隨時容易觸底反彈，屬於值得留意買點的好機會"
+        else:
+            zone, logic = "多空平衡區（20～80）", "股價處於正常波動範圍，以順勢操作或參考交叉訊號為主"
+
+        kd_cross = ""
+        kd_diff = (d["K"] - d["D"]).dropna().tail(4)
+        if len(kd_diff) >= 2:
+            sg = [1 if v > 0 else (-1 if v < 0 else 0) for v in kd_diff]
+            for x in range(len(sg) - 1, 0, -1):
+                if sg[x] > 0 and sg[x - 1] <= 0:
+                    kd_cross = "｜近期 K 由下往上穿越 D（黃金交叉），短線買盤轉強"
+                    break
+                if sg[x] < 0 and sg[x - 1] >= 0:
+                    kd_cross = "｜近期 K 由上往下跌破 D（死亡交叉），短線賣壓轉強"
+                    break
+        items.append((*names[1], bool(k > dd and k < 80),
+                      f"K {k:.0f}／D {dd:.0f}｜{zone}：{logic}{kd_cross}", stds[1]))
 
     # 3. RSI：依數值區間對照市場含意與操作邏輯
     rsi = last["RSI"]
@@ -1633,8 +1719,21 @@ def _technical_items(d):
         items.append((*names[4], None, "資料不足 20 日", stds[4]))
     else:
         bias = (close - ma20) / ma20 * 100
-        zone = "，正乖離過大，留意回檔" if bias >= BIAS_OVERHEAT else ("，負乖離過大，留意超跌反彈" if bias <= -BIAS_OVERHEAT else "")
-        items.append((*names[4], bool(bias < BIAS_OVERHEAT), f"20日乖離率 {bias:+.2f}%{zone}", stds[4]))
+        if bias >= BIAS_OVERHEAT:
+            zone, logic = "正乖離過大＝短線超買、嚴重過熱", "股價遠高於市場平均成本，短線獲利賣壓極重，隨時可能拉回修正，屬追高風險極大的壞位置"
+        elif bias <= -BIAS_OVERHEAT:
+            zone, logic = "負乖離過大＝短線超賣、跌深恐慌", "股價遠低於市場平均成本，市場陷入非理性拋售，但隨時會出現強烈反彈，是左側交易者尋找潛在好買點的觀察區"
+        elif abs(bias) <= 2:
+            above_ma60 = (not pd.isna(ma60)) and close > ma60
+            zone, logic = "接近 0%＝多空成本平衡", (
+                "股價貼近均線；目前站在季線之上偏多頭，拉回均線有撐時常是好買點" if above_ma60 else
+                "股價貼近均線；目前在季線之下偏空頭，反彈遇均線壓力時留意反轉點")
+        elif bias > 0:
+            zone, logic = "正乖離（未達過熱）", "股價高於均線但尚在合理範圍，留意乖離持續擴大"
+        else:
+            zone, logic = "負乖離（未達超跌）", "股價低於均線但尚在合理範圍，可觀察是否止跌回穩"
+        items.append((*names[4], bool(bias < BIAS_OVERHEAT),
+                      f"20日乖離率 {bias:+.2f}%｜{zone}：{logic}", stds[4]))
 
     return items
 
