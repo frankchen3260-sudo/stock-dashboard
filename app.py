@@ -518,6 +518,8 @@ def render_institutional(symbol):
         "外資含外資自營商；資料通常於交易日收盤後（約 16:00 至 17:00）才公布，資料來源為" + f"{source}" + "，僅供參考。"
     )
 
+    return table
+
 
 # ---------------------------------------------------------------------------
 # 三大法人買賣超：官方免費資料（證交所 T86／櫃買中心），FinMind 為備援
@@ -864,6 +866,8 @@ def render_monthly_analysis(monthly, display_name):
         "僅供參考，不構成投資建議。"
     )
 
+    return signals, total
+
 
 # ---------------------------------------------------------------------------
 # 日K線趨勢分析
@@ -1060,6 +1064,8 @@ def render_daily_analysis(symbol):
         "判讀規則整理自常見的日線技術分析經驗（均線排列、區間突破、量價、KD、MACD、RSI、K棒型態），"
         "僅供參考，不構成投資建議。"
     )
+
+    return signals, total
 
 
 # ---------------------------------------------------------------------------
@@ -1315,6 +1321,79 @@ def render_live_quote(symbol):
 
 
 # ---------------------------------------------------------------------------
+# 購買指標燈號（放在結果最上方）：達到條件亮紅燈、未達到亮綠燈、資料不足亮白燈
+# ---------------------------------------------------------------------------
+def _beacon_items(pe_ratio, eps_last4, inst_table, daily_res, monthly_res):
+    """回傳 [(指標名稱, 狀態, 說明)]，狀態：True=達到、False=未達到、None=資料不足。"""
+    items = []
+
+    # 1. 本益比 < 30
+    if isinstance(pe_ratio, (int, float)) and pe_ratio > 0:
+        items.append(("本益比 < 30", pe_ratio < 30, f"目前本益比 {pe_ratio:.2f}"))
+    else:
+        items.append(("本益比 < 30", None, "無本益比資料（可能為虧損或資料缺漏）"))
+
+    # 2. 連續四季 EPS 為正
+    if eps_last4 is not None and len(eps_last4) >= 4:
+        last4 = list(eps_last4.head(4).values)
+        ok = all(v > 0 for v in last4)
+        items.append(("連續四季 EPS 為正", ok, "近四季（新→舊）：" + "、".join(f"{v:.2f}" for v in last4)))
+    else:
+        items.append(("連續四季 EPS 為正", None, "取得的季度 EPS 不足四季"))
+
+    # 3~5. 外資、投信、自營商：各自連續買進兩天以上
+    for inst in ("外資", "投信", "自營商"):
+        name = f"{inst}連續買進 ≥ 2 天"
+        if inst_table is not None and len(inst_table) >= 2 and inst in inst_table.columns:
+            direction, count = _streak(inst_table[inst])
+            if direction > 0 and count >= 2:
+                items.append((name, True, f"已連續買超 {count} 天"))
+            elif direction > 0:
+                items.append((name, False, "最近一日買超，但尚未連續兩天"))
+            elif direction < 0:
+                items.append((name, False, f"已連續賣超 {count} 天"))
+            else:
+                items.append((name, False, "最近一日買賣持平"))
+        else:
+            items.append((name, None, "無法人資料"))
+
+    # 4 / 5. 日K、月K：偏多訊號數 > 偏空訊號數
+    for name, res in (("日K趨勢 偏多 > 偏空", daily_res), ("月K趨勢 偏多 > 偏空", monthly_res)):
+        if res is None:
+            items.append((name, None, "資料不足，無法判讀"))
+        else:
+            signals = res[0]
+            bull = sum(1 for _, _, sc in signals if sc > 0)
+            bear = sum(1 for _, _, sc in signals if sc < 0)
+            items.append((name, bull > bear, f"偏多 {bull} 項、偏空 {bear} 項"))
+    return items
+
+
+def render_beacons(slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res):
+    items = _beacon_items(pe_ratio, eps_last4, inst_table, daily_res, monthly_res)
+    valid = [ok for _, ok, _ in items if ok is not None]
+    hit = sum(1 for ok in valid if ok)
+
+    with slot.container():
+        st.markdown("##### 🚦 購買指標燈號")
+        per_row = 4
+        for start in range(0, len(items), per_row):
+            cols = st.columns(per_row)
+            for col, (name, ok, detail) in zip(cols, items[start:start + per_row]):
+                lamp = "⚪" if ok is None else ("🔴" if ok else "🟢")
+                state = "資料不足" if ok is None else ("達到" if ok else "未達到")
+                col.markdown(f"### {lamp}")
+                col.markdown(f"**{name}**")
+                col.caption(f"{state}｜{detail}")
+        st.caption(
+            f"目前達到 **{hit} / {len(valid)}** 項（資料不足的項目不計入）。"
+            "🔴 紅燈＝達到條件　🟢 綠燈＝未達到　⚪ 白燈＝資料不足。"
+            "外資、投信、自營商各自從最新一天往回數連續買超天數；日K、月K以趨勢分析中偏多訊號數與偏空訊號數比較。"
+            "僅為條件檢查，不構成投資建議。"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 頁面設定與 Session State
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="股票分析", layout="wide")
@@ -1437,6 +1516,7 @@ def run_search(user_keyword):
 
 
 def render_analysis(symbol_upper, time_period):
+    beacon_slot = None
     try:
         with st.spinner("⏳ 載入中，請稍候…"):
             df = fetch_history(symbol_upper, time_period)
@@ -1538,6 +1618,8 @@ def render_analysis(symbol_upper, time_period):
 
         # --- 渲染 ---
         st.subheader(f"📊 {display_name} ({symbol_upper}) 分析結果")
+        beacon_slot = st.empty()
+        beacon_slot.info("🚦 購買指標燈號計算中…")
         render_live_quote(symbol_upper)
         getattr(st, diag_level)(diagnostic_msg)
 
@@ -1610,12 +1692,15 @@ def render_analysis(symbol_upper, time_period):
         )
         show_chart(fig)
 
-        render_institutional(symbol_upper)
-        render_daily_analysis(symbol_upper)
-        render_monthly_analysis(monthly_df, display_name)
+        inst_table = render_institutional(symbol_upper)
+        daily_res = render_daily_analysis(symbol_upper)
+        monthly_res = render_monthly_analysis(monthly_df, display_name)
+        render_beacons(beacon_slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res)
         render_news(symbol_upper, display_name)
 
     except Exception as e:
+        if beacon_slot is not None:
+            beacon_slot.empty()
         st.error(f"讀取資料發生錯誤: {e}")
 
 
