@@ -1537,8 +1537,17 @@ def _technical_items(d):
     stds = [
         "股價同時站上季線(60日)與年線(240日)視為中長期多頭",
         "K > D 且 K < 80（未進入超買區）視為偏多",
-        "RSI 介於 50～70（買方占優但未過熱）視為偏多",
-        "柱狀體 OSC > 0（DIF 在 MACD 之上）視為偏多",
+        "紅燈：RSI 落在 52～70「多頭強勢」區（買方占優但未過熱）。\n\n"
+        "• 70 以上｜超買區（過熱）：買方力道極強，但接近 80 需警惕追高風險，短期可能高檔折返或修正。\n\n"
+        "• 50～70｜多頭強勢：買方大於賣方，多方控盤，屬穩健上漲趨勢，走勢相對偏好。\n\n"
+        "• 50 附近（48～52）｜多空平衡：買賣力道持平，可能處於盤整、觀望期或方向選擇中。\n\n"
+        "• 30～50｜空頭弱勢：賣方大於買方，空方控盤，股價偏向盤跌或弱勢。\n\n"
+        "• 30 以下｜超賣區（過冷）：賣方力道極強，股價已連續拋售，但也暗示短期內具反彈機會，是尋找潛在買點的觀察區。",
+        "紅燈：柱狀體 OSC > 0（DIF 在 MACD 之上，紅柱）。\n\n"
+        "• 快慢線在 0 軸之上｜絕對多頭市場：走勢偏好，以做多為主，每一次回檔波段往往是尋找買點的機會。\n\n"
+        "• 快慢線在 0 軸之下｜絕對空頭市場：走勢偏壞，宜觀望或做空為主，反彈往往是強弩之末。\n\n"
+        "• 柱狀體由綠翻紅（由負變正）｜買方動能增強：下跌力道減弱、上漲動能開始爆發，屬於波段「轉好」的起點。\n\n"
+        "• 柱狀體由紅翻綠（由正變負）｜賣方動壓湧現：上漲力道竭盡、下跌動能開始增強，屬於波段「轉壞」的起點。",
         f"乖離率(20日) < {BIAS_OVERHEAT:g}%（未過熱）視為合理",
     ]
     if d is None or len(d) < 30:
@@ -1573,21 +1582,50 @@ def _technical_items(d):
         zone = "，高檔超買" if k >= 80 else ("，低檔超賣" if k <= 20 else "")
         items.append((*names[1], bool(k > dd and k < 80), f"K {k:.0f}／D {dd:.0f}{zone}", stds[1]))
 
-    # 3. RSI
+    # 3. RSI：依數值區間對照市場含意與操作邏輯
     rsi = last["RSI"]
     if pd.isna(rsi):
         items.append((*names[2], None, "資料不足", stds[2]))
     else:
-        zone = "，超買" if rsi >= 70 else ("，超賣" if rsi <= 30 else "")
-        items.append((*names[2], bool(50 < rsi < 70), f"RSI(14) {rsi:.0f}{zone}", stds[2]))
+        if rsi >= 70:
+            zone, logic = "超買區（過熱）", "買方力道極強；接近 80 需警惕追高風險，短期可能高檔折返或修正"
+        elif rsi <= 30:
+            zone, logic = "超賣區（過冷）", "賣方力道極強；股價已連續拋售，但短期內具反彈機會，可列入觀察買點"
+        elif 48 <= rsi <= 52:
+            zone, logic = "多空平衡（50 附近）", "買賣力道持平；可能處於盤整、觀望期或方向選擇中"
+        elif rsi > 52:
+            zone, logic = "多頭強勢（50～70）", "買方大於賣方，多方控盤，屬穩健上漲趨勢，走勢相對偏好"
+        else:
+            zone, logic = "空頭弱勢（30～50）", "賣方大於買方，空方控盤，股價偏向盤跌或弱勢"
+        items.append((*names[2], bool(52 < rsi < 70), f"RSI(14) {rsi:.0f}｜{zone}：{logic}", stds[2]))
 
-    # 4. MACD
+    # 4. MACD：快慢線與 0 軸的位置 + 柱狀體翻色
     if pd.isna(last["OSC"]):
         items.append((*names[3], None, "資料不足", stds[3]))
     else:
-        axis = "零軸上" if last["DIF"] > 0 else "零軸下"
-        items.append((*names[3], bool(last["OSC"] > 0),
-                      f"DIF {last['DIF']:.2f}／MACD {last['MACD']:.2f}（{axis}），柱狀體 {last['OSC']:+.2f}", stds[3]))
+        dif, sig, osc = last["DIF"], last["MACD"], last["OSC"]
+        if dif > 0 and sig > 0:
+            zone, logic = "快慢線在 0 軸之上＝絕對多頭市場", "走勢偏好，以做多為主，回檔波段往往是尋找買點的機會"
+        elif dif < 0 and sig < 0:
+            zone, logic = "快慢線在 0 軸之下＝絕對空頭市場", "走勢偏壞，宜觀望或做空為主，反彈往往是強弩之末"
+        else:
+            zone, logic = "快慢線在 0 軸附近（一上一下）", "多空轉換中，方向尚未明確"
+
+        # 近 3 個交易日內柱狀體是否翻色（台股：正＝紅柱、負＝綠柱）
+        osc_recent = d["OSC"].dropna().tail(4)
+        flip = ""
+        if len(osc_recent) >= 2:
+            signs = [1 if v > 0 else (-1 if v < 0 else 0) for v in osc_recent]
+            for i in range(len(signs) - 1, 0, -1):
+                if signs[i] > 0 and signs[i - 1] <= 0:
+                    flip = "柱狀體由綠翻紅（由負變正）＝買方動能增強，下跌力道減弱、上漲動能開始爆發，屬波段轉好的起點"
+                    break
+                if signs[i] < 0 and signs[i - 1] >= 0:
+                    flip = "柱狀體由紅翻綠（由正變負）＝賣方壓力湧現，上漲力道竭盡、下跌動能開始增強，屬波段轉壞的起點"
+                    break
+        hist = flip or f"柱狀體 {osc:+.2f}，{'紅柱延續' if osc > 0 else '綠柱延續'}，未見翻色"
+        items.append((*names[3], bool(osc > 0),
+                      f"DIF {dif:.2f}／MACD {sig:.2f}｜{zone}：{logic}｜{hist}", stds[3]))
 
     # 5. 乖離率（對 20 日均線）
     ma20 = last["MA20"]
