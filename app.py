@@ -12,22 +12,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-# 💡 中文對照字典（代號 → 中文名稱）
-STOCK_ZH_DICT = {
-    "2313.TW": "華通",
-    "3167.TW": "大量",
-    "2330.TW": "台積電",
-    "2317.TW": "鴻海",
-    "2454.TW": "聯發科",
-    "2308.TW": "台達電",
-    "2812.TW": "台中銀",
-    "00881.TW": "國泰台灣科技龍頭",
-}
 # 分析用的歷史資料區間（固定近 1 年）
 TIME_PERIOD = "1y"
-
-# 反向字典（中文名稱 → 代號），讓使用者可以直接輸入中文
-ZH_TO_TICKER = {name: sym for sym, name in STOCK_ZH_DICT.items()}
 
 # 英文名稱關鍵字 → 強制中文名稱
 ENGLISH_OVERRIDES = {
@@ -249,8 +235,6 @@ def get_ticker_from_name(input_text):
 
     if upper.endswith(".TW") or upper.endswith(".TWO"):
         return upper
-    if text in ZH_TO_TICKER:
-        return ZH_TO_TICKER[text]
     if text.isdigit() and len(text) >= 4:
         return f"{text}.TW"
 
@@ -274,11 +258,8 @@ def get_ticker_from_name(input_text):
 
 
 def resolve_display_name(symbol, keyword="", fallback_name=""):
-    """決定要顯示的名稱，優先順序：字典 → 中文輸入 → 搜尋名稱 → 代號。"""
+    """決定要顯示的名稱，優先順序：證交所名稱清單 → 中文輸入 → 搜尋名稱 → 代號。"""
     base = symbol.split(".")[0]
-
-    if symbol in STOCK_ZH_DICT:
-        return STOCK_ZH_DICT[symbol]
 
     tw_name = get_tw_names().get(symbol)
     if tw_name:
@@ -1874,6 +1855,176 @@ def render_company_intro(symbol, info, display_name):
 
 
 # ---------------------------------------------------------------------------
+# 市場排行：成交量前10（即時）、三大法人買超／賣超前10（盤後公布）
+# ---------------------------------------------------------------------------
+def _mis_batch(ex_chs):
+    """證交所即時行情一次查多檔（一批最多約 100 檔）。回傳 msgArray。"""
+    resp = _mis_session().get(
+        "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+        params={"ex_ch": "|".join(ex_chs), "json": "1", "delay": "0", "_": int(time.time() * 1000)},
+        timeout=8,
+    )
+    resp.raise_for_status()
+    return resp.json().get("msgArray") or []
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_volume_rank(top_n=30):
+    """掃描全部上市櫃 4 碼代號（含 ETF）的累計成交量，回傳前 N 名（預設 30）。短暫快取 10 秒讓多人共用。"""
+    names = get_tw_names()
+    codes = [sym for sym in names if sym.split(".")[0].isdigit() and len(sym.split(".")[0]) == 4]
+    if not codes:
+        raise RuntimeError("無法取得台股代號清單")
+    ex_chs = [("otc_" if sym.endswith(".TWO") else "tse_") + sym.split(".")[0] + ".tw" for sym in codes]
+    batches = [ex_chs[i:i + 100] for i in range(0, len(ex_chs), 100)]
+
+    rows, errors = [], 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for fut in [pool.submit(_mis_batch, b) for b in batches]:
+            try:
+                arr = fut.result()
+            except Exception:
+                errors += 1
+                continue
+            for item in arr:
+                vol = _to_float(item.get("v"))
+                if not vol:
+                    continue
+                price = _to_float(item.get("z")) or _first_price(item.get("b")) or _first_price(item.get("a"))
+                prev = _to_float(item.get("y"))
+                pct = (price - prev) / prev * 100 if price and prev else None
+                rows.append({
+                    "代號": item.get("c", ""),
+                    "名稱": item.get("n", ""),
+                    "成交價": price,
+                    "漲跌幅(%)": pct,
+                    "成交量(張)": vol,
+                    "_time": _fmt_mis_time(item.get("d", ""), item.get("t", "")),
+                })
+    if errors == len(batches) or not rows:
+        raise RuntimeError("無法連線至證交所即時行情")
+    df = pd.DataFrame(rows).sort_values("成交量(張)", ascending=False).head(top_n).reset_index(drop=True)
+    df.index = df.index + 1
+    return df, errors, len(batches)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_inst_rank(top_n=30):
+    """最近一個有公布資料的交易日，三大法人合計買賣超（張）排行。回傳 (日期, 買超表, 賣超表)。"""
+    store = _inst_store()
+    today = datetime.datetime.now(TW_TZ).date()
+    names = get_tw_names()
+    for i in range(0, 12):
+        day = today - datetime.timedelta(days=i)
+        if day.weekday() >= 5:
+            continue
+        try:
+            tw = _fetch_market_day("TW", day, store)
+        except Exception:
+            continue
+        if not tw:
+            continue  # 假日或今日尚未公布，往前一天
+        try:
+            otc = _fetch_market_day("OTC", day, store)
+        except Exception:
+            otc = {}
+        rows = []
+        for market_data, suffix in ((tw, ".TW"), (otc, ".TWO")):
+            for code, (f, t, d) in market_data.items():
+                total = f + t + d
+                if total == 0:
+                    continue
+                rows.append({
+                    "代號": code,
+                    "名稱": names.get(code + suffix) or code,
+                    "外資": f, "投信": t, "自營": d,
+                    "合計(張)": total,
+                })
+        df = pd.DataFrame(rows)
+        buy = df.sort_values("合計(張)", ascending=False).head(top_n).reset_index(drop=True)
+        sell = df.sort_values("合計(張)", ascending=True).head(top_n).reset_index(drop=True)
+        buy.index, sell.index = buy.index + 1, sell.index + 1
+        return day, buy, sell
+    raise RuntimeError("近期查無三大法人資料")
+
+
+def _style_rank(df, pct_col=None, net_cols=()):
+    """台股慣例：紅＝上漲／買超、綠＝下跌／賣超。"""
+    def color(v):
+        if not isinstance(v, (int, float)) or pd.isna(v) or v == 0:
+            return ""
+        return "color: #e53935" if v > 0 else "color: #2e7d32"
+    fmt = {c: "{:+,.0f}" for c in net_cols}
+    fmt["成交量(張)"] = "{:,.0f}"
+    fmt["成交價"] = "{:,.2f}"
+    fmt["漲跌幅(%)"] = "{:+.2f}"
+    fmt = {k: v for k, v in fmt.items() if k in df.columns}
+    styler = df.style.format(fmt, na_rep="N/A")
+    for col in ([pct_col] if pct_col else []) + list(net_cols):
+        styler = styler.map(color, subset=[col])
+    return styler
+
+
+def _rank_cfg(df):
+    """所有欄位用小寬度，兩張表並排時不需橫向捲動。"""
+    return {c: st.column_config.Column(width="small") for c in df.columns}
+
+
+def _volume_rank_body():
+    try:
+        df, errors, nb = fetch_volume_rank(30)
+    except Exception as e:
+        st.warning(f"⚠️ 目前無法取得成交量排行：{e}")
+        return
+    shown = df.drop(columns=["_time"])
+    st.dataframe(_style_rank(shown, pct_col="漲跌幅(%)"), width="stretch", height=35 * (len(shown) + 1) + 3, column_config=_rank_cfg(shown))
+    note = f"　（有 {errors}/{nb} 批資料抓取失敗，排行可能不完整）" if errors else ""
+    st.caption(f"⚡ 資料時間 {df['_time'].iloc[0]}　來源：臺灣證交所即時行情（上市＋上櫃 4 碼代號，含 ETF）{note}")
+
+
+# 交易時間每 10 秒自動更新，其餘時間只在載入時更新一次
+volume_rank_auto = st.fragment(run_every=10)(_volume_rank_body)
+volume_rank_static = st.fragment(_volume_rank_body)
+
+
+def render_market_tab():
+    st.subheader("🔥 即時成交量最大前 30 檔")
+    if is_market_open():
+        st.caption("🟢 交易時間，每 10 秒自動更新")
+        volume_rank_auto()
+    else:
+        st.caption("⚪ 目前非交易時間，顯示最近一次成交量（重新整理頁面可更新）")
+        volume_rank_static()
+
+    st.markdown("---")
+    st.subheader("🏦 三大法人買超／賣超前 30 檔")
+    try:
+        with st.spinner("讀取三大法人資料中…"):
+            day, buy, sell = fetch_inst_rank(30)
+    except Exception as e:
+        st.warning(f"⚠️ 目前無法取得三大法人排行：{e}")
+        return
+    st.caption(
+        f"📅 資料日期 {day.isoformat()}　來源：證交所／櫃買中心（外資＋投信＋自營商合計，單位：張）。"
+        "官方約於收盤後下午 4 點起公布，盤中無法取得即時法人買賣超，因此顯示最近一個已公布的交易日。"
+    )
+    nets = ("外資", "投信", "自營", "合計(張)")
+    if is_mobile():
+        st.markdown("##### 🔴 買超前 30")
+        st.dataframe(_style_rank(buy, net_cols=nets), width="stretch", height=35 * (len(buy) + 1) + 3, column_config=_rank_cfg(buy))
+        st.markdown("##### 🟢 賣超前 30")
+        st.dataframe(_style_rank(sell, net_cols=nets), width="stretch", height=35 * (len(sell) + 1) + 3, column_config=_rank_cfg(sell))
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("##### 🔴 買超前 30")
+            st.dataframe(_style_rank(buy, net_cols=nets), width="stretch", height=35 * (len(buy) + 1) + 3, column_config=_rank_cfg(buy))
+        with c2:
+            st.markdown("##### 🟢 賣超前 30")
+            st.dataframe(_style_rank(sell, net_cols=nets), width="stretch", height=35 * (len(sell) + 1) + 3, column_config=_rank_cfg(sell))
+
+
+# ---------------------------------------------------------------------------
 # 頁面設定與 Session State
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="股票分析", layout="wide")
@@ -1891,11 +2042,25 @@ st.markdown(
     }
 
     /* 手機版：縮小邊距與字級、欄位改成每列 2 個、底部留白避免被平台徽章遮住 */
+    /* 頁籤按鈕：加大、加粗，選中的有底色，一眼就看得出來 */
+    div[data-baseweb="tab-list"] { gap: 0.5rem; }
+    button[data-baseweb="tab"] {
+        height: 3.2rem;
+        padding: 0 1.6rem;
+        border-radius: 10px 10px 0 0;
+        background: rgba(128, 128, 128, 0.10);
+    }
+    button[data-baseweb="tab"] p { font-size: 1.35rem !important; font-weight: 700 !important; }
+    button[data-baseweb="tab"][aria-selected="true"] { background: rgba(255, 75, 75, 0.14); }
+    div[data-baseweb="tab-highlight"] { height: 4px !important; }
+
     @media (max-width: 640px) {
         .block-container, [data-testid="stMainBlockContainer"] {
             padding: 2.2rem 0.8rem 5rem 0.8rem !important;
         }
         h1 { font-size: 1.6rem !important; line-height: 1.3 !important; }
+        button[data-baseweb="tab"] { padding: 0 0.9rem; height: 2.8rem; }
+        button[data-baseweb="tab"] p { font-size: 1.1rem !important; }
         h2, h3 { font-size: 1.2rem !important; }
         [data-testid="stMain"] [data-testid="stHorizontalBlock"] {
             flex-wrap: wrap !important;
@@ -2192,101 +2357,109 @@ def render_analysis(symbol_upper, time_period):
         st.error(f"讀取資料發生錯誤: {e}")
 
 
-# ---------------------------------------------------------------------------
-# 主畫面：輸入區
-# ---------------------------------------------------------------------------
-mobile = is_mobile()
-if mobile:
-    # 手機：輸入框與按鈕由上而下全寬排列
-    in_col = btn_col = st.container()
-else:
-    in_col, btn_col, _spacer = st.columns([3, 1.5, 5], vertical_alignment="bottom")
+tab_stock, tab_market = st.tabs(["🔍 個股分析", "🔥 市場排行"])
 
-with in_col:
-    st.text_input("請輸入股票代號或中文名稱：", key="input_val")
-with btn_col:
-    st.button(
-        "🔍 開始搜尋並分析",
-        type="primary",
-        on_click=handle_search_button_click,
-        width="stretch" if mobile else "content",
+with tab_stock:
+    # ---------------------------------------------------------------------------
+    # 主畫面：輸入區
+    # ---------------------------------------------------------------------------
+    mobile = is_mobile()
+    if mobile:
+        # 手機：輸入框與按鈕由上而下全寬排列
+        in_col = btn_col = st.container()
+    else:
+        in_col, btn_col, _spacer = st.columns([3, 1.5, 5], vertical_alignment="bottom")
+
+    with in_col:
+        st.text_input("請輸入股票代號或中文名稱：", key="input_val")
+    with btn_col:
+        st.button(
+            "🔍 開始搜尋並分析",
+            type="primary",
+            on_click=handle_search_button_click,
+            width="stretch" if mobile else "content",
+        )
+
+    time_period = TIME_PERIOD  # 固定為近 1 年
+
+
+    # ---------------------------------------------------------------------------
+    # 載入中 / 停止搜尋 / 結果顯示
+    # ---------------------------------------------------------------------------
+    stop_slot = st.empty()  # 載入期間才會出現的「停止搜尋」按鈕
+    result_slot = st.empty()  # 結果區：每次重新載入時整塊替換，舊畫面會立刻消失
+
+    pending = st.session_state.pending_search
+    trigger = st.session_state.trigger_search
+    busy = bool(pending) or (
+        bool(trigger) and not trigger.startswith("FAILED:") and not st.session_state.search_stopped
     )
 
-time_period = TIME_PERIOD  # 固定為近 1 年
+    if busy:
+        stop_slot.button("⏹ 停止搜尋", key="stop_search_btn", on_click=stop_search)
+
+    if pending:
+        st.session_state.pending_search = ""
+        with result_slot.container():
+            with st.spinner(f"⏳ 搜尋「{pending}」中，請稍候…"):
+                run_search(pending)
+
+    # ---------------------------------------------------------------------------
+    # 側邊欄：搜尋紀錄
+    # ---------------------------------------------------------------------------
+    with st.sidebar:
+        st.header("🕒 搜尋紀錄")
+
+        if st.session_state.search_history:
+            for i, (hist_name, hist_symbol) in enumerate(st.session_state.search_history):
+                col_btn, col_del = st.columns([4, 1])
+                with col_btn:
+                    st.button(
+                        f"🔍 {hist_name}",
+                        key=f"btn_{hist_symbol}_{i}",
+                        on_click=click_history_btn,
+                        args=(hist_symbol, hist_name),
+                        width="stretch",
+                    )
+                with col_del:
+                    st.button(
+                        "❌",
+                        key=f"del_{hist_symbol}_{i}",
+                        on_click=delete_single_history,
+                        args=(i,),
+                        width="stretch",
+                    )
+
+            st.markdown("---")
+            if st.button("🗑️ 清除所有紀錄", type="primary", width="stretch"):
+                st.session_state.search_history = []
+                st.rerun()
+        else:
+            st.info("目前沒有搜尋紀錄")
 
 
-# ---------------------------------------------------------------------------
-# 載入中 / 停止搜尋 / 結果顯示
-# ---------------------------------------------------------------------------
-stop_slot = st.empty()  # 載入期間才會出現的「停止搜尋」按鈕
-result_slot = st.empty()  # 結果區：每次重新載入時整塊替換，舊畫面會立刻消失
+    trigger = st.session_state.trigger_search
 
-pending = st.session_state.pending_search
-trigger = st.session_state.trigger_search
-busy = bool(pending) or (
-    bool(trigger) and not trigger.startswith("FAILED:") and not st.session_state.search_stopped
-)
+    if st.session_state.search_stopped:
+        result_slot.warning("⏹ 已停止搜尋。")
 
-if busy:
-    stop_slot.button("⏹ 停止搜尋", key="stop_search_btn", on_click=stop_search)
+    elif not trigger:
+        result_slot.info("👋 歡迎使用股票分析儀！請在上方輸入股票代號或名稱，並點選「開始搜尋並分析」。")
 
-if pending:
-    st.session_state.pending_search = ""
-    with result_slot.container():
-        with st.spinner(f"⏳ 搜尋「{pending}」中，請稍候…"):
-            run_search(pending)
+    elif trigger.startswith("FAILED:"):
+        failed_keyword = trigger.replace("FAILED:", "", 1)
+        with result_slot.container():
+            st.error(f"❌ 找不到「{failed_keyword}」的相關股票資料。請檢查輸入是否正確。")
+            if any("\u4e00" <= ch <= "\u9fff" for ch in failed_keyword) and not get_tw_names():
+                st.warning("⚠️ 目前無法連線取得台股中文名稱清單，請改輸入股票代號（例如 2383），或檢查網路連線。")
 
-# ---------------------------------------------------------------------------
-# 側邊欄：搜尋紀錄
-# ---------------------------------------------------------------------------
-with st.sidebar:
-    st.header("🕒 搜尋紀錄")
-
-    if st.session_state.search_history:
-        for i, (hist_name, hist_symbol) in enumerate(st.session_state.search_history):
-            col_btn, col_del = st.columns([4, 1])
-            with col_btn:
-                st.button(
-                    f"🔍 {hist_name}",
-                    key=f"btn_{hist_symbol}_{i}",
-                    on_click=click_history_btn,
-                    args=(hist_symbol, hist_name),
-                    width="stretch",
-                )
-            with col_del:
-                st.button(
-                    "❌",
-                    key=f"del_{hist_symbol}_{i}",
-                    on_click=delete_single_history,
-                    args=(i,),
-                    width="stretch",
-                )
-
-        st.markdown("---")
-        if st.button("🗑️ 清除所有紀錄", type="primary", width="stretch"):
-            st.session_state.search_history = []
-            st.rerun()
     else:
-        st.info("目前沒有搜尋紀錄")
+        with result_slot.container():
+            render_analysis(trigger.upper(), time_period)
+
+    stop_slot.empty()  # 載入完成，移除停止按鈕
 
 
-trigger = st.session_state.trigger_search
-
-if st.session_state.search_stopped:
-    result_slot.warning("⏹ 已停止搜尋。")
-
-elif not trigger:
-    result_slot.info("👋 歡迎使用股票分析儀！請在上方輸入股票代號或名稱，並點選「開始搜尋並分析」。")
-
-elif trigger.startswith("FAILED:"):
-    failed_keyword = trigger.replace("FAILED:", "", 1)
-    with result_slot.container():
-        st.error(f"❌ 找不到「{failed_keyword}」的相關股票資料。請檢查輸入是否正確。")
-        if any("\u4e00" <= ch <= "\u9fff" for ch in failed_keyword) and not get_tw_names():
-            st.warning("⚠️ 目前無法連線取得台股中文名稱清單，請改輸入股票代號（例如 2383），或檢查網路連線。")
-
-else:
-    with result_slot.container():
-        render_analysis(trigger.upper(), time_period)
-
-stop_slot.empty()  # 載入完成，移除停止按鈕
+# 市場排行放在最後執行：個股分析先完成顯示，排行資料較慢時不會卡住搜尋結果
+with tab_market:
+    render_market_tab()
