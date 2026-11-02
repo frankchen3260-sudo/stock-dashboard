@@ -46,13 +46,13 @@ def is_mobile():
     return "Mobile" in ua or "iPhone" in ua
 
 
-def show_chart(fig):
+def show_chart(fig, height=None):
     """統一圖表外觀；手機版縮小高度、圖例放下方，並關閉拖曳縮放，避免手指滑頁面時被圖表搶走。"""
     mobile = is_mobile()
     fig.update_layout(
         margin=dict(l=8, r=8, t=48, b=48),
         legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="left", x=0),
-        height=380 if mobile else 520,
+        height=height or (380 if mobile else 520),
     )
     if mobile:
         fig.update_layout(title=dict(font=dict(size=15)))
@@ -432,15 +432,23 @@ def render_institutional(symbol):
         return
 
     stock_id = symbol.split(".")[0]
-    try:
-        with st.spinner("讀取法人資料中..."):
-            raw = fetch_institutional_raw(stock_id)
-    except Exception as e:
-        st.warning(f"⚠️ 目前無法取得法人資料：{e}")
-        return
+    source = "證交所／櫃買中心公開資料"
+    table = None
+    with st.spinner("讀取法人資料中（第一次約需數秒）..."):
+        try:
+            table = fetch_institutional_official(symbol, days=10)
+        except Exception as official_err:
+            # 官方來源失敗時，退回 FinMind（需要有額度或 token）
+            try:
+                table = summarize_institutional(fetch_institutional_raw(stock_id), days=10)
+                source = "FinMind（備援）"
+            except Exception as fallback_err:
+                st.warning(
+                    f"⚠️ 目前無法取得法人資料。官方來源：{official_err}；FinMind：{fallback_err}"
+                )
+                return
 
-    table = summarize_institutional(raw, days=10)
-    if table.empty:
+    if table is None or table.empty:
         st.info("查無近期法人買賣超資料（可能是新上市、停牌或資料尚未更新）。")
         return
 
@@ -453,11 +461,32 @@ def render_institutional(symbol):
         total = table[name].sum()
         buy_days = int((table[name] > 0).sum())
         sell_days = int((table[name] < 0).sum())
-        col.metric(f"{name} 近{len(table)}日", f"{total:+,.0f} 張")
+        color = "red" if total > 0 else ("green" if total < 0 else "gray")  # 台股：紅買綠賣
+        col.caption(f"{name} 近{len(table)}日")
+        col.markdown(f"### :{color}[{total:+,.0f} 張]")
         col.caption(f"買超 {buy_days} 天 / 賣超 {sell_days} 天")
 
     # --- 各法人判斷與連續買賣 ---
-    st.dataframe(judge_df, hide_index=True, width="stretch")
+    def _color_signed_text(v):
+        text = str(v)
+        if text.startswith("+") and text.strip("+,0") not in ("", "."):
+            return "color: #ff4b4b"  # 買超：紅
+        if text.startswith("-"):
+            return "color: #21c354"  # 賣超：綠
+        return ""
+
+    judge_styler = judge_df.style
+    net_col = [c for c in judge_df.columns if "買賣超" in c][0]
+    judge_styler = (getattr(judge_styler, "map", None) or judge_styler.applymap)(
+        _color_signed_text, subset=[net_col]
+    )
+    judge_styler = (getattr(judge_styler, "map", None) or judge_styler.applymap)(
+        lambda v: "color: #ff4b4b", subset=["買超天數"]
+    )
+    judge_styler = (getattr(judge_styler, "map", None) or judge_styler.applymap)(
+        lambda v: "color: #21c354", subset=["賣超天數"]
+    )
+    st.dataframe(judge_styler, hide_index=True, width="stretch")
 
     # --- 每日買賣超長條圖 ---
     fig_i = go.Figure()
@@ -480,10 +509,154 @@ def render_institutional(symbol):
     styler = (getattr(styler, "map", None) or styler.applymap)(_color_net)
     st.dataframe(styler, width="stretch")
 
+    if len(table) < 10:
+        st.caption(
+            f"⚠️ 目前只取得近 {len(table)} 個交易日的資料（部分日期可能尚未公布或暫時抓取失敗，稍後重新整理可補齊）。"
+        )
     st.caption(
         "📌 單位為「張」（1 張 = 1,000 股），正數為買超、負數為賣超，紅色買超、綠色賣超。"
-        "外資含外資自營商；資料通常於交易日收盤後才更新，資料來源為 FinMind（證交所／櫃買中心公開資訊），僅供參考。"
+        "外資含外資自營商；資料通常於交易日收盤後（約 16:00 至 17:00）才公布，資料來源為" + f"{source}" + "，僅供參考。"
     )
+
+
+# ---------------------------------------------------------------------------
+# 三大法人買賣超：官方免費資料（證交所 T86／櫃買中心），FinMind 為備援
+# ---------------------------------------------------------------------------
+@st.cache_resource
+def _inst_store():
+    """全站共用的快取（可在執行緒內安全使用）：{(市場, 日期): (抓取時間, {代號: (外資, 投信, 自營商)})}"""
+    return {}
+
+
+def _to_num(x):
+    try:
+        return float(str(x).replace(",", "").strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def _parse_t86(js):
+    """證交所 T86：整個上市市場某一天的三大法人買賣超（股）。換算成張。"""
+    if js.get("stat") != "OK" or not js.get("data"):
+        return {}  # 假日或尚未公布
+    fields = js["fields"]
+    foreign_idx = [
+        i for i, f in enumerate(fields)
+        if f.startswith(("外陸資買賣超股數", "外資自營商買賣超股數")) or f == "外資買賣超股數"
+    ]
+    trust_idx = fields.index("投信買賣超股數")
+    dealer_idx = fields.index("自營商買賣超股數")  # 第一個完全相符的是自營商合計
+    out = {}
+    for row in js["data"]:
+        out[str(row[0]).strip()] = (
+            sum(_to_num(row[i]) for i in foreign_idx) / 1000,
+            _to_num(row[trust_idx]) / 1000,
+            _to_num(row[dealer_idx]) / 1000,
+        )
+    return out
+
+
+def _parse_tpex(js):
+    """櫃買中心：整個上櫃市場某一天的三大法人買賣超（股）。依欄位名稱找欄位。"""
+    tables = js.get("tables") or []
+    if not tables or not tables[0].get("data"):
+        return {}
+    fields = [str(f) for f in tables[0]["fields"]]
+
+    def find(pred):
+        for i, f in enumerate(fields):
+            if f.endswith("買賣超股數") and pred(f):
+                return i
+        raise ValueError("櫃買中心欄位格式與預期不符")
+
+    foreign_i = find(lambda f: f.startswith("外資及陸資") and "不含" not in f)
+    trust_i = find(lambda f: f.startswith("投信"))
+    dealer_i = find(lambda f: f.startswith("自營商") and "自行買賣" not in f and "避險" not in f)
+    out = {}
+    for row in tables[0]["data"]:
+        out[str(row[0]).strip()] = (
+            _to_num(row[foreign_i]) / 1000,
+            _to_num(row[trust_i]) / 1000,
+            _to_num(row[dealer_i]) / 1000,
+        )
+    return out
+
+
+def _fetch_market_day(market, day, store):
+    """抓某市場某一天的全市場法人資料（有快取）。過去日期快取 24 小時，今天快取 10 分鐘。"""
+    key = (market, day.isoformat())
+    today = datetime.datetime.now(TW_TZ).date()
+    ttl = 600 if day == today else 86400
+    hit = store.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    def _request():
+        if market == "TW":
+            resp = requests.get(
+                "https://www.twse.com.tw/rwd/zh/fund/T86",
+                params={"date": day.strftime("%Y%m%d"), "selectType": "ALL", "response": "json"},
+                headers=headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return _parse_t86(resp.json())
+        else:
+            resp = requests.get(
+                "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade",
+                params={"type": "Daily", "sect": "EW", "date": day.strftime("%Y/%m/%d"), "id": "", "response": "json"},
+                headers=headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return _parse_tpex(resp.json())
+
+    for attempt in range(3):  # 偶爾被官方限流，稍等後重試
+        try:
+            data = _request()
+            break
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(1.0 * (attempt + 1))
+
+    if data or day != today:  # 今天還沒公布（空資料）時不要快取，晚點再試
+        store[key] = (time.time(), data)
+    time.sleep(0.2)  # 對官方網站客氣一點
+    return data
+
+
+def fetch_institutional_official(symbol, days=10):
+    """從證交所／櫃買中心抓近 N 個交易日資料，整理成與 summarize_institutional 相同的表格（單位：張）。"""
+    market = "OTC" if symbol.endswith(".TWO") else "TW"
+    code = symbol.split(".")[0]
+    store = _inst_store()
+    today = datetime.datetime.now(TW_TZ).date()
+    dates = [today - datetime.timedelta(days=i) for i in range(24)]
+    dates = [d for d in dates if d.weekday() < 5]  # 只抓週一到週五，新 → 舊
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [(d, pool.submit(_fetch_market_day, market, d, store)) for d in dates]
+        rows, errors = {}, 0
+        for d, fut in futures:
+            try:
+                data = fut.result()
+            except Exception:
+                errors += 1
+                continue
+            if code in data:
+                rows[d] = data[code]
+    if errors > len(dates) // 2:
+        raise RuntimeError("無法連線至證交所／櫃買中心")
+
+    if not rows:
+        return pd.DataFrame()
+    table = pd.DataFrame.from_dict(rows, orient="index", columns=["外資", "投信", "自營商"]).sort_index()
+    table.index = [d.strftime("%Y-%m-%d") for d in table.index]
+    table["三大法人合計"] = table.sum(axis=1)
+    return table.tail(days)
 
 
 # ---------------------------------------------------------------------------
