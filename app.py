@@ -3168,7 +3168,7 @@ def _kline_start():
 
 
 def render_kline_analysis():
-    st.markdown("##### 📐 K線分析：用型態判斷進出場時機")
+    st.markdown("##### 📐 K線分析：判斷進出場時機")
     mobile_ = is_mobile()
     c1, c2 = (st.container(), st.container()) if mobile_ else st.columns([3, 1], vertical_alignment="bottom")
     with c1:
@@ -3184,7 +3184,7 @@ def render_kline_analysis():
 
     req = st.session_state.get("kline_req")
     if req is None:
-        st.info("請輸入股票代號或名稱後按「開始分析」；留白則分析「個股分析」目前查詢的股票。")
+        st.info("請輸入股票代號或名稱後按「開始分析」。")
         return
     kw, default_symbol = req
     target = kw or default_symbol
