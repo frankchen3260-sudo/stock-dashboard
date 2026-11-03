@@ -1,19 +1,36 @@
+import contextlib
 import datetime
 import os
 import time
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor
+from html import escape as html_escape
 from io import StringIO
 
+import numpy as np
 import pandas as pd
 import requests
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+# 💡 中文對照字典（代號 → 中文名稱）
+STOCK_ZH_DICT = {
+    "2313.TW": "華通",
+    "3167.TW": "大量",
+    "2330.TW": "台積電",
+    "2317.TW": "鴻海",
+    "2454.TW": "聯發科",
+    "2308.TW": "台達電",
+    "2812.TW": "台中銀",
+    "00881.TW": "國泰台灣科技龍頭",
+}
 # 分析用的歷史資料區間（固定近 1 年）
 TIME_PERIOD = "1y"
+
+# 反向字典（中文名稱 → 代號），讓使用者可以直接輸入中文
+ZH_TO_TICKER = {name: sym for sym, name in STOCK_ZH_DICT.items()}
 
 # 英文名稱關鍵字 → 強制中文名稱
 ENGLISH_OVERRIDES = {
@@ -235,6 +252,8 @@ def get_ticker_from_name(input_text):
 
     if upper.endswith(".TW") or upper.endswith(".TWO"):
         return upper
+    if text in ZH_TO_TICKER:
+        return ZH_TO_TICKER[text]
     if text.isdigit() and len(text) >= 4:
         return f"{text}.TW"
 
@@ -258,8 +277,11 @@ def get_ticker_from_name(input_text):
 
 
 def resolve_display_name(symbol, keyword="", fallback_name=""):
-    """決定要顯示的名稱，優先順序：證交所名稱清單 → 中文輸入 → 搜尋名稱 → 代號。"""
+    """決定要顯示的名稱，優先順序：字典 → 中文輸入 → 搜尋名稱 → 代號。"""
     base = symbol.split(".")[0]
+
+    if symbol in STOCK_ZH_DICT:
+        return STOCK_ZH_DICT[symbol]
 
     tw_name = get_tw_names().get(symbol)
     if tw_name:
@@ -1855,176 +1877,6 @@ def render_company_intro(symbol, info, display_name):
 
 
 # ---------------------------------------------------------------------------
-# 市場排行：成交量前10（即時）、三大法人買超／賣超前10（盤後公布）
-# ---------------------------------------------------------------------------
-def _mis_batch(ex_chs):
-    """證交所即時行情一次查多檔（一批最多約 100 檔）。回傳 msgArray。"""
-    resp = _mis_session().get(
-        "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
-        params={"ex_ch": "|".join(ex_chs), "json": "1", "delay": "0", "_": int(time.time() * 1000)},
-        timeout=8,
-    )
-    resp.raise_for_status()
-    return resp.json().get("msgArray") or []
-
-
-@st.cache_data(ttl=10, show_spinner=False)
-def fetch_volume_rank(top_n=30):
-    """掃描全部上市櫃 4 碼代號（含 ETF）的累計成交量，回傳前 N 名（預設 30）。短暫快取 10 秒讓多人共用。"""
-    names = get_tw_names()
-    codes = [sym for sym in names if sym.split(".")[0].isdigit() and len(sym.split(".")[0]) == 4]
-    if not codes:
-        raise RuntimeError("無法取得台股代號清單")
-    ex_chs = [("otc_" if sym.endswith(".TWO") else "tse_") + sym.split(".")[0] + ".tw" for sym in codes]
-    batches = [ex_chs[i:i + 100] for i in range(0, len(ex_chs), 100)]
-
-    rows, errors = [], 0
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        for fut in [pool.submit(_mis_batch, b) for b in batches]:
-            try:
-                arr = fut.result()
-            except Exception:
-                errors += 1
-                continue
-            for item in arr:
-                vol = _to_float(item.get("v"))
-                if not vol:
-                    continue
-                price = _to_float(item.get("z")) or _first_price(item.get("b")) or _first_price(item.get("a"))
-                prev = _to_float(item.get("y"))
-                pct = (price - prev) / prev * 100 if price and prev else None
-                rows.append({
-                    "代號": item.get("c", ""),
-                    "名稱": item.get("n", ""),
-                    "成交價": price,
-                    "漲跌幅(%)": pct,
-                    "成交量(張)": vol,
-                    "_time": _fmt_mis_time(item.get("d", ""), item.get("t", "")),
-                })
-    if errors == len(batches) or not rows:
-        raise RuntimeError("無法連線至證交所即時行情")
-    df = pd.DataFrame(rows).sort_values("成交量(張)", ascending=False).head(top_n).reset_index(drop=True)
-    df.index = df.index + 1
-    return df, errors, len(batches)
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_inst_rank(top_n=30):
-    """最近一個有公布資料的交易日，三大法人合計買賣超（張）排行。回傳 (日期, 買超表, 賣超表)。"""
-    store = _inst_store()
-    today = datetime.datetime.now(TW_TZ).date()
-    names = get_tw_names()
-    for i in range(0, 12):
-        day = today - datetime.timedelta(days=i)
-        if day.weekday() >= 5:
-            continue
-        try:
-            tw = _fetch_market_day("TW", day, store)
-        except Exception:
-            continue
-        if not tw:
-            continue  # 假日或今日尚未公布，往前一天
-        try:
-            otc = _fetch_market_day("OTC", day, store)
-        except Exception:
-            otc = {}
-        rows = []
-        for market_data, suffix in ((tw, ".TW"), (otc, ".TWO")):
-            for code, (f, t, d) in market_data.items():
-                total = f + t + d
-                if total == 0:
-                    continue
-                rows.append({
-                    "代號": code,
-                    "名稱": names.get(code + suffix) or code,
-                    "外資": f, "投信": t, "自營": d,
-                    "合計(張)": total,
-                })
-        df = pd.DataFrame(rows)
-        buy = df.sort_values("合計(張)", ascending=False).head(top_n).reset_index(drop=True)
-        sell = df.sort_values("合計(張)", ascending=True).head(top_n).reset_index(drop=True)
-        buy.index, sell.index = buy.index + 1, sell.index + 1
-        return day, buy, sell
-    raise RuntimeError("近期查無三大法人資料")
-
-
-def _style_rank(df, pct_col=None, net_cols=()):
-    """台股慣例：紅＝上漲／買超、綠＝下跌／賣超。"""
-    def color(v):
-        if not isinstance(v, (int, float)) or pd.isna(v) or v == 0:
-            return ""
-        return "color: #e53935" if v > 0 else "color: #2e7d32"
-    fmt = {c: "{:+,.0f}" for c in net_cols}
-    fmt["成交量(張)"] = "{:,.0f}"
-    fmt["成交價"] = "{:,.2f}"
-    fmt["漲跌幅(%)"] = "{:+.2f}"
-    fmt = {k: v for k, v in fmt.items() if k in df.columns}
-    styler = df.style.format(fmt, na_rep="N/A")
-    for col in ([pct_col] if pct_col else []) + list(net_cols):
-        styler = styler.map(color, subset=[col])
-    return styler
-
-
-def _rank_cfg(df):
-    """所有欄位用小寬度，兩張表並排時不需橫向捲動。"""
-    return {c: st.column_config.Column(width="small") for c in df.columns}
-
-
-def _volume_rank_body():
-    try:
-        df, errors, nb = fetch_volume_rank(30)
-    except Exception as e:
-        st.warning(f"⚠️ 目前無法取得成交量排行：{e}")
-        return
-    shown = df.drop(columns=["_time"])
-    st.dataframe(_style_rank(shown, pct_col="漲跌幅(%)"), width="stretch", height=35 * (len(shown) + 1) + 3, column_config=_rank_cfg(shown))
-    note = f"　（有 {errors}/{nb} 批資料抓取失敗，排行可能不完整）" if errors else ""
-    st.caption(f"⚡ 資料時間 {df['_time'].iloc[0]}　來源：臺灣證交所即時行情（上市＋上櫃 4 碼代號，含 ETF）{note}")
-
-
-# 交易時間每 10 秒自動更新，其餘時間只在載入時更新一次
-volume_rank_auto = st.fragment(run_every=10)(_volume_rank_body)
-volume_rank_static = st.fragment(_volume_rank_body)
-
-
-def render_market_tab():
-    st.subheader("🔥 即時成交量最大前 30 檔")
-    if is_market_open():
-        st.caption("🟢 交易時間，每 10 秒自動更新")
-        volume_rank_auto()
-    else:
-        st.caption("⚪ 目前非交易時間，顯示最近一次成交量（重新整理頁面可更新）")
-        volume_rank_static()
-
-    st.markdown("---")
-    st.subheader("🏦 三大法人買超／賣超前 30 檔")
-    try:
-        with st.spinner("讀取三大法人資料中…"):
-            day, buy, sell = fetch_inst_rank(30)
-    except Exception as e:
-        st.warning(f"⚠️ 目前無法取得三大法人排行：{e}")
-        return
-    st.caption(
-        f"📅 資料日期 {day.isoformat()}　來源：證交所／櫃買中心（外資＋投信＋自營商合計，單位：張）。"
-        "官方約於收盤後下午 4 點起公布，盤中無法取得即時法人買賣超，因此顯示最近一個已公布的交易日。"
-    )
-    nets = ("外資", "投信", "自營", "合計(張)")
-    if is_mobile():
-        st.markdown("##### 🔴 買超前 30")
-        st.dataframe(_style_rank(buy, net_cols=nets), width="stretch", height=35 * (len(buy) + 1) + 3, column_config=_rank_cfg(buy))
-        st.markdown("##### 🟢 賣超前 30")
-        st.dataframe(_style_rank(sell, net_cols=nets), width="stretch", height=35 * (len(sell) + 1) + 3, column_config=_rank_cfg(sell))
-    else:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("##### 🔴 買超前 30")
-            st.dataframe(_style_rank(buy, net_cols=nets), width="stretch", height=35 * (len(buy) + 1) + 3, column_config=_rank_cfg(buy))
-        with c2:
-            st.markdown("##### 🟢 賣超前 30")
-            st.dataframe(_style_rank(sell, net_cols=nets), width="stretch", height=35 * (len(sell) + 1) + 3, column_config=_rank_cfg(sell))
-
-
-# ---------------------------------------------------------------------------
 # 頁面設定與 Session State
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="股票分析", layout="wide")
@@ -2042,25 +1894,11 @@ st.markdown(
     }
 
     /* 手機版：縮小邊距與字級、欄位改成每列 2 個、底部留白避免被平台徽章遮住 */
-    /* 頁籤按鈕：加大、加粗，選中的有底色，一眼就看得出來 */
-    div[data-baseweb="tab-list"] { gap: 0.5rem; }
-    button[data-baseweb="tab"] {
-        height: 3.2rem;
-        padding: 0 1.6rem;
-        border-radius: 10px 10px 0 0;
-        background: rgba(128, 128, 128, 0.10);
-    }
-    button[data-baseweb="tab"] p { font-size: 1.35rem !important; font-weight: 700 !important; }
-    button[data-baseweb="tab"][aria-selected="true"] { background: rgba(255, 75, 75, 0.14); }
-    div[data-baseweb="tab-highlight"] { height: 4px !important; }
-
     @media (max-width: 640px) {
         .block-container, [data-testid="stMainBlockContainer"] {
             padding: 2.2rem 0.8rem 5rem 0.8rem !important;
         }
         h1 { font-size: 1.6rem !important; line-height: 1.3 !important; }
-        button[data-baseweb="tab"] { padding: 0 0.9rem; height: 2.8rem; }
-        button[data-baseweb="tab"] p { font-size: 1.1rem !important; }
         h2, h3 { font-size: 1.2rem !important; }
         [data-testid="stMain"] [data-testid="stHorizontalBlock"] {
             flex-wrap: wrap !important;
@@ -2163,7 +2001,7 @@ def run_search(user_keyword):
 def render_analysis(symbol_upper, time_period):
     beacon_slot = None
     try:
-        with st.spinner("⏳ 載入中，請稍候…"):
+        with st.spinner("⏳ 載入資料中，請稍候…"):
             df = fetch_history(symbol_upper, time_period)
             info, dividends_series, splits_series, eps_quarterly, monthly_df = (
                 fetch_fundamentals(symbol_upper)
@@ -2357,12 +2195,1211 @@ def render_analysis(symbol_upper, time_period):
         st.error(f"讀取資料發生錯誤: {e}")
 
 
-tab_stock, tab_market = st.tabs(["🔍 個股分析", "🔥 市場排行"])
+# ---------------------------------------------------------------------------
+# 頁籤二：即時市場排行（成交量前 20 名，每分鐘更新，附簡易走勢圖）
+# 做法：證交所 MIS 即時行情分批查詢全部上市櫃股票／ETF，依累計成交量排序
+# ---------------------------------------------------------------------------
+RANK_TOP_N = 20
+MIS_BATCH_SIZE = 100
+
+
+def _rank_universe():
+    """可排行的標的：一般股票（4 碼）與 ETF（00 開頭）。回傳 [(市場, 代號, 名稱)]。"""
+    out = []
+    for sym, name in get_tw_names().items():
+        code, _, suffix = sym.partition(".")
+        if (code.isdigit() and len(code) == 4) or code.startswith("00"):
+            out.append(("otc" if suffix == "TWO" else "tse", code, name))
+    return out
+
+
+def _mis_batch(sess, batch):
+    """一次查一批代號；失敗回傳 None。"""
+    ex_ch = "|".join(f"{ex}_{code}.tw" for ex, code, _ in batch)
+    for attempt in range(2):
+        try:
+            resp = sess.get(
+                "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+                params={"ex_ch": ex_ch, "json": "1", "delay": "0", "_": int(time.time() * 1000)},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            arr = resp.json().get("msgArray") or []
+            if arr:
+                time.sleep(0.3)  # 對官方網站客氣一點
+                return arr
+        except Exception:
+            pass
+        time.sleep(0.8)
+    return None
+
+
+def _rank_bucket():
+    """快取版本：交易時間每分鐘換一次；非交易時間每 30 分鐘換一次（避免休市時一直重抓）。"""
+    now = int(time.time())
+    return f"open-{now // 60}" if is_market_open() else f"closed-{now // 1800}"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_sparklines(symbols, bucket):
+    """用 Yahoo 5 分 K 取得各檔「最近一個交易日」的走勢（收盤價清單）。失敗回傳空字典。"""
+    out = {}
+    if not symbols:
+        return out
+    try:
+        raw = yf.download(
+            list(symbols), period="5d", interval="5m", group_by="ticker",
+            progress=False, threads=True, auto_adjust=False,
+        )
+    except Exception:
+        raw = None
+    for s in (symbols if raw is not None else ()):
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                if s not in raw.columns.get_level_values(0):
+                    continue
+                sub = raw[s]
+            else:
+                sub = raw
+            close = sub["Close"].dropna()
+            if close.empty:
+                continue
+            last_day = close.index[-1].date()
+            close = close[[ts.date() == last_day for ts in close.index]]
+            if len(close) >= 2:
+                out[s] = [float(v) for v in close.values]
+        except Exception:
+            continue
+    if _fugle_key():  # Yahoo 沒抓到的，改用 Fugle 當日 5 分 K 補上
+        for s in symbols:
+            if s in out:
+                continue
+            try:
+                js = _fugle_get(f"intraday/candles/{s.split('.')[0]}", timeframe="5")
+                closes = [float(c["close"]) for c in js.get("data") or [] if c.get("close")]
+                if len(closes) >= 2:
+                    out[s] = closes
+            except Exception:
+                continue
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_market_rank(bucket):
+    """全市場累計成交量前 N 名。bucket 只用來控制快取更新頻率；失敗會丟出例外（不會被快取）。"""
+    universe = _rank_universe()
+    if not universe:
+        raise RuntimeError("無法取得台股代號清單，請稍後再試")
+    sess = _mis_session()  # 在主執行緒取得，再交給工作執行緒使用
+    batches = [universe[i:i + MIS_BATCH_SIZE] for i in range(0, len(universe), MIS_BATCH_SIZE)]
+    name_map = {(ex, code): name for ex, code, name in universe}
+
+    items, failed = [], 0
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for arr in pool.map(lambda b: _mis_batch(sess, b), batches):
+            if arr is None:
+                failed += 1
+            else:
+                items.extend(arr)
+    if failed > len(batches) // 2:
+        raise RuntimeError("證交所即時行情暫時無法連線（可能被限流），請稍後再試")
+
+    rows = []
+    for it in items:
+        vol = _to_float(it.get("v"))
+        if not vol:
+            continue
+        q = _parse_mis(it)
+        price, prev = q["price"] or q["prev_close"], q["prev_close"]
+        if not price:
+            continue
+        ex = it.get("ex") or "tse"
+        code = str(it.get("c", "")).strip()
+        rows.append(
+            {
+                "symbol": code + (".TWO" if ex == "otc" else ".TW"),
+                "code": code,
+                "name": it.get("n") or name_map.get((ex, code), code),
+                "price": price,
+                "prev": prev,
+                "volume": vol,
+                "time": q["time"],
+            }
+        )
+    rows.sort(key=lambda r: r["volume"], reverse=True)
+    top = rows[:RANK_TOP_N]
+    spark = fetch_sparklines(tuple(r["symbol"] for r in top), bucket)
+    return {
+        "rows": top,
+        "spark": spark,
+        "fetched_at": datetime.datetime.now(TW_TZ).strftime("%H:%M:%S"),
+        "covered": len(items),
+        "total": len(universe),
+        "failed": failed,
+        "source": "證交所即時行情",
+        "backup": False,
+    }
+
+
+def _fugle_key():
+    """讀取 Fugle API key：.streamlit/secrets.toml 裡名稱含 FUGLE 的欄位（或 [fugle] 區段），或同名環境變數。"""
+    try:
+        for k in st.secrets:
+            if "FUGLE" not in str(k).upper():
+                continue
+            v = st.secrets[k]
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if hasattr(v, "keys"):  # [fugle] 區段：取第一個字串值
+                for kk in v.keys():
+                    if isinstance(v[kk], str) and v[kk].strip():
+                        return v[kk].strip()
+    except Exception:
+        pass
+    for k, v in os.environ.items():
+        if "FUGLE" in k.upper() and v.strip():
+            return v.strip()
+    return ""
+
+
+def _fugle_get(path, **params):
+    key = _fugle_key()
+    if not key:
+        raise RuntimeError("未設定 Fugle API key")
+    resp = requests.get(
+        f"https://api.fugle.tw/marketdata/v1.0/stock/{path}",
+        params=params,
+        headers={"X-API-KEY": key},
+        timeout=10,
+    )
+    if resp.status_code == 401:
+        raise RuntimeError("Fugle API key 驗證失敗")
+    if resp.status_code == 403:
+        raise RuntimeError("Fugle 目前的方案不支援此功能（成交量排行需開發者以上方案）")
+    resp.raise_for_status()
+    return resp.json()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_market_rank_fugle(bucket):
+    """備援一：Fugle 成交量排行（上市＋上櫃，近即時）。"""
+    rows, stamp = [], ""
+    for market, suffix in (("TSE", ".TW"), ("OTC", ".TWO")):
+        js = _fugle_get(f"snapshot/actives/{market}", trade="volume", type="ALLBUT0999")
+        t = str(js.get("time", ""))
+        if len(t) >= 6:
+            stamp = f"{js.get('date', '')} {t[:2]}:{t[2:4]}:{t[4:6]}"
+        for d in js.get("data") or []:
+            vol, price = d.get("tradeVolume"), d.get("closePrice")
+            if not vol or not price:
+                continue
+            code = str(d.get("symbol", "")).strip()
+            rows.append(
+                {
+                    "symbol": code + suffix,
+                    "code": code,
+                    "name": d.get("name") or code,
+                    "price": float(price),
+                    "prev": float(price) - float(d.get("change") or 0),
+                    "volume": float(vol),  # Fugle 成交量單位：張
+                    "time": stamp,
+                }
+            )
+    if not rows:
+        raise RuntimeError("Fugle 沒有回傳成交資料")
+    rows.sort(key=lambda r: r["volume"], reverse=True)
+    top = rows[:RANK_TOP_N]
+    return {
+        "rows": top,
+        "spark": fetch_sparklines(tuple(r["symbol"] for r in top), bucket),
+        "fetched_at": datetime.datetime.now(TW_TZ).strftime("%H:%M:%S"),
+        "covered": len(rows),
+        "total": len(rows),
+        "failed": 0,
+        "source": "Fugle 行情（備援）",
+        "backup": True,
+        "realtime": True,
+    }
+
+
+def _finmind_get(dataset, **params):
+    """FinMind 備援來源共用請求；token 從 .streamlit/secrets.toml 或環境變數讀取。"""
+    p = {"dataset": dataset, **params}
+    token = _finmind_token()
+    if token:
+        p["token"] = token
+    resp = requests.get("https://api.finmindtrade.com/api/v4/data", params=p, timeout=20)
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("status") != 200:
+        raise RuntimeError(body.get("msg", "FinMind 回傳錯誤"))
+    return pd.DataFrame(body.get("data", []))
+
+
+def _recent_weekdays(n=14, include_today=True):
+    day = datetime.datetime.now(TW_TZ).date()
+    if not include_today:
+        day -= datetime.timedelta(days=1)
+    out = []
+    while len(out) < n:
+        if day.weekday() < 5:
+            out.append(day)
+        day -= datetime.timedelta(days=1)
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_market_rank_backup(bucket):
+    """備援：FinMind 最近一個交易日的成交量排行（非即時）。"""
+    df = pd.DataFrame()
+    day = None
+    for day in _recent_weekdays(10):
+        df = _finmind_get("TaiwanStockPrice", start_date=day.isoformat(), end_date=day.isoformat())
+        if not df.empty:
+            break
+    if df.empty:
+        raise RuntimeError("FinMind 查無資料（可能需要在 .streamlit/secrets.toml 設定 FINMIND_TOKEN）")
+    df["stock_id"] = df["stock_id"].astype(str)
+    df = df[df["stock_id"].map(lambda c: (c.isdigit() and len(c) == 4) or c.startswith("00"))]
+    df = df.sort_values("Trading_Volume", ascending=False).head(RANK_TOP_N)
+    names = get_tw_names()
+    rows = []
+    for _, r in df.iterrows():
+        code = r["stock_id"]
+        suffix = ".TWO" if (code + ".TWO") in names and (code + ".TW") not in names else ".TW"
+        close = float(r["close"])
+        rows.append(
+            {
+                "symbol": code + suffix,
+                "code": code,
+                "name": names.get(code + suffix, code),
+                "price": close,
+                "prev": close - float(r.get("spread", 0) or 0),
+                "volume": float(r["Trading_Volume"]) / 1000,  # 股 → 張
+                "time": day.isoformat(),
+            }
+        )
+    spark = fetch_sparklines(tuple(r["symbol"] for r in rows), bucket)
+    return {
+        "rows": rows,
+        "spark": spark,
+        "fetched_at": datetime.datetime.now(TW_TZ).strftime("%H:%M:%S"),
+        "covered": len(df),
+        "total": len(df),
+        "failed": 0,
+        "source": "FinMind（備援，非即時）",
+        "backup": True,
+        "realtime": False,
+    }
+
+
+def _change_badge(price, prev):
+    """台股慣例：紅漲綠跌。回傳 (漲跌, 漲跌幅文字)。"""
+    if not prev:
+        return None, "N/A"
+    chg = price - prev
+    pct = chg / prev * 100
+    icon = "🔴 ▲" if chg > 0 else ("🟢 ▼" if chg < 0 else "⚪ ")
+    return chg, f"{icon}{abs(pct):.2f}%"
+
+
+def _market_rank_body():
+    bucket = _rank_bucket()
+    data, errors = None, []
+    first_load = not st.session_state.get("_rank_loaded", False)
+    with st.spinner("⏳ 載入資料中，請稍候…") if first_load else contextlib.nullcontext():
+        for label, fn in (
+            ("證交所即時行情", fetch_market_rank),
+            ("Fugle", fetch_market_rank_fugle),
+            ("FinMind", fetch_market_rank_backup),
+        ):
+            try:
+                data = fn(bucket)
+                break
+            except Exception as e:
+                errors.append(f"{label}：{e}")
+    if data is not None:
+        st.session_state["_rank_loaded"] = True
+    if data is None:
+        st.warning("⚠️ 目前無法取得即時排行。" + "；".join(errors))
+        return
+    if data.get("backup"):
+        tail = "" if data.get("realtime", True) else "，顯示最近一個交易日的排行（非即時）"
+        st.warning(f"⚠️ 證交所即時行情暫時無法使用（{errors[0]}），已改用備援來源「{data['source']}」{tail}。")
+    rows = data["rows"]
+    if not rows:
+        st.info("目前沒有成交資料（尚未開盤或休市）。")
+        return
+
+    table = pd.DataFrame(
+        {
+            "排名": list(range(1, len(rows) + 1)),
+            "代號": [r["code"] for r in rows],
+            "名稱": [r["name"] for r in rows],
+            "成交價": [r["price"] for r in rows],
+            "漲跌幅": [_change_badge(r["price"], r["prev"])[1] for r in rows],
+            "成交量(張)": [r["volume"] for r in rows],
+            "走勢": [data["spark"].get(r["symbol"]) for r in rows],
+        }
+    )
+    st.dataframe(
+        table,
+        hide_index=True,
+        width="stretch",
+        height=min(35 * (len(rows) + 1) + 3, 740),
+        column_config={
+            "排名": st.column_config.NumberColumn(width="small"),
+            "成交價": st.column_config.NumberColumn(format="%.2f"),
+            "成交量(張)": st.column_config.NumberColumn(format="%d"),
+            "走勢": st.column_config.LineChartColumn("走勢（當日 5 分K）", width="medium"),
+        },
+    )
+    latest = max((r["time"] for r in rows if r["time"]), default="")
+    st.caption(
+        f"⚡ 更新時間 {data['fetched_at']}　資料時間 {latest}　掃描 {data['covered']}/{data['total']} 檔　"
+        f"來源：{data['source']}（成交量）、Yahoo Finance（走勢圖，可能延遲）"
+    )
+    if data["failed"]:
+        st.caption(f"⚠️ 有 {data['failed']} 批資料暫時抓取失敗，排行可能不完整，下次更新會自動補上。")
+
+
+market_rank_auto = st.fragment(run_every=60)(_market_rank_body)
+market_rank_static = st.fragment(_market_rank_body)
+
+
+def render_market_rank():
+    st.markdown("##### 🔥 即時成交量排行（前 20 名）")
+    c1, c2 = st.columns([3, 1]) if not is_mobile() else (st.container(), st.container())
+    with c1:
+        st.toggle("🔄 交易時間每分鐘自動更新", value=True, key="rank_auto_refresh")
+    with c2:
+        if st.button("立即更新", key="rank_refresh_btn"):
+            fetch_market_rank.clear()
+            fetch_sparklines.clear()
+            st.session_state["_rank_loaded"] = False
+    if st.session_state.get("rank_auto_refresh", True) and is_market_open():
+        market_rank_auto()
+    else:
+        market_rank_static()
+        if not is_market_open():
+            st.caption("目前非交易時間，顯示最近一個交易日的成交量排行。")
+
+
+# ---------------------------------------------------------------------------
+# 頁籤三：前一交易日 三大法人買超／賣超前 20 名（證交所 T86 + 櫃買中心）
+# ---------------------------------------------------------------------------
+INST_RANK_TOP_N = 20
+
+
+def _inst_rows(by_code, names, industries=None):
+    """by_code: {(代號, 後綴): (外資, 投信, 自營商)} → DataFrame"""
+    rows = []
+    for (code, suffix), (foreign, trust, dealer) in by_code.items():
+        rows.append(
+            {
+                "代號": code,
+                "名稱": names.get(code + suffix, ""),
+                "產業別": (industries or {}).get(code + suffix, ""),
+                "合計": foreign + trust + dealer,
+                "外資": foreign,
+                "投信": trust,
+                "自營商": dealer,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _inst_rank_official():
+    """主要來源：證交所 T86 + 櫃買中心。找「今天以前」最近一個有資料的交易日。"""
+    store = _inst_store()
+    data_tw, day = {}, None
+    for day in _recent_weekdays(14, include_today=False):
+        data_tw = _fetch_market_day("TW", day, store)
+        if data_tw:
+            break
+    if not data_tw:
+        raise RuntimeError("證交所查無最近的三大法人資料")
+    otc_ok = True
+    try:
+        data_otc = _fetch_market_day("OTC", day, store)
+    except Exception:
+        data_otc, otc_ok = {}, False
+    by_code = {(c, ".TW"): v for c, v in data_tw.items()}
+    by_code.update({(c, ".TWO"): v for c, v in data_otc.items()})
+    df = _inst_rows(by_code, get_tw_names(), _industry_store())
+    return df, day.isoformat(), otc_ok, "證交所 T86、櫃買中心"
+
+
+def _inst_rank_finmind():
+    """備援：FinMind 全市場單日三大法人買賣超。"""
+    raw, day = pd.DataFrame(), None
+    for day in _recent_weekdays(14, include_today=False):
+        raw = _finmind_get(
+            "TaiwanStockInstitutionalInvestorsBuySell", start_date=day.isoformat(), end_date=day.isoformat()
+        )
+        if not raw.empty:
+            break
+    if raw.empty:
+        raise RuntimeError("FinMind 查無資料（可能需要在 .streamlit/secrets.toml 設定 FINMIND_TOKEN）")
+    raw["stock_id"] = raw["stock_id"].astype(str)
+    if raw["name"].isin(["Dealer_self", "Dealer_Hedging"]).any():
+        raw = raw[raw["name"] != "Dealer"]  # 已有自營商細項就不重複計入合計
+    raw["group"] = raw["name"].map(INSTITUTION_GROUPS)
+    raw = raw.dropna(subset=["group"])
+    raw["net"] = (raw["buy"].astype(float) - raw["sell"].astype(float)) / 1000  # 股 → 張
+    pivot = raw.pivot_table(index="stock_id", columns="group", values="net", aggfunc="sum").fillna(0)
+    for col in ("外資", "投信", "自營商"):
+        if col not in pivot.columns:
+            pivot[col] = 0.0
+    names = get_tw_names()
+    by_code = {}
+    for code, r in pivot.iterrows():
+        suffix = ".TWO" if (code + ".TWO") in names and (code + ".TW") not in names else ".TW"
+        by_code[(code, suffix)] = (r["外資"], r["投信"], r["自營商"])
+    return _inst_rows(by_code, names), day.isoformat(), True, "FinMind（備援）"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_prev_day_institutional_rank():
+    """回傳 (資料表, 日期, 櫃買是否成功, 來源說明, 主要來源錯誤訊息)。主要來源失敗就改用 FinMind。"""
+    try:
+        return _inst_rank_official() + ("",)
+    except Exception as e_main:
+        try:
+            return _inst_rank_finmind() + (str(e_main),)
+        except Exception as e_backup:
+            raise RuntimeError(f"主要來源：{e_main}；備援來源（FinMind）：{e_backup}")
+
+
+def _render_rank_table(df, title, color):
+    st.markdown(f"**{title}**")
+    shown = df.drop(columns=["產業別"]).copy()  # 產業別資料常為空白，不顯示
+    shown.insert(0, "排名", range(1, len(shown) + 1))
+    num_cols = ["合計", "外資", "投信", "自營商"]
+    styler = shown.style.format({c: "{:+,.0f}" for c in num_cols})
+    styler = (getattr(styler, "map", None) or styler.applymap)(_color_net, subset=num_cols)
+    st.dataframe(
+        styler,
+        hide_index=True,
+        width="stretch",
+        height=35 * (len(shown) + 1) + 3,
+        column_config={
+            "排名": st.column_config.NumberColumn(width="small"),
+            "代號": st.column_config.TextColumn(width="small"),
+            "名稱": st.column_config.TextColumn(width="large"),
+            "合計": st.column_config.NumberColumn(width="small"),
+            "外資": st.column_config.NumberColumn(width="small"),
+            "投信": st.column_config.NumberColumn(width="small"),
+            "自營商": st.column_config.NumberColumn(width="small"),
+        },
+    )
+
+
+def render_prev_day_institutional_rank():
+    st.markdown("##### 🏦 前一交易日 三大法人買超／賣超 前 20 名")
+    try:
+        with st.spinner("⏳ 載入資料中，請稍候…"):
+            df, day_str, otc_ok, source, main_err = fetch_prev_day_institutional_rank()
+    except Exception as e:
+        st.warning(f"⚠️ 目前無法取得法人買賣超資料：{e}")
+        return
+    if df.empty:
+        st.info("該交易日沒有法人買賣超資料。")
+        return
+
+    if main_err:
+        st.warning(f"⚠️ 證交所／櫃買中心資料暫時無法使用（{main_err}），已改用備援來源 FinMind。")
+    day = datetime.date.fromisoformat(day_str)
+    weekday = "一二三四五六日"[day.weekday()]
+    st.caption(f"📅 資料日期：{day_str}（週{weekday}）　單位：張（1 張 = 1,000 股）　紅色買超、綠色賣超")
+
+    top_buy = df[df["合計"] > 0].nlargest(INST_RANK_TOP_N, "合計")
+    top_sell = df[df["合計"] < 0].nsmallest(INST_RANK_TOP_N, "合計")
+    # 上下排列、各佔滿寬度，欄位才不會被擠壓而截斷文字
+    _render_rank_table(top_buy, "🔴 買超前 20 名", "red")
+    _render_rank_table(top_sell, "🟢 賣超前 20 名", "green")
+
+    if not otc_ok:
+        st.caption("⚠️ 櫃買中心資料暫時抓取失敗，目前排行只含上市股票，稍後重新整理可補齊。")
+    st.caption("📌 「合計」為外資（含外資自營商）＋投信＋自營商；資料來源：" + source + "，僅供參考。")
+
+
+# ---------------------------------------------------------------------------
+# 頁籤四：K線分析（用 K 線型態判斷進出場時機）
+# 進場：錘形線、多頭吞噬、早晨之星、拉回買進、突破買進
+# 出場：上吊線／射擊之星、空頭吞噬、黃昏之星、跌破支撐／均線
+# 台股慣例：紅K＝收盤高於開盤，黑K＝收盤低於開盤
+# ---------------------------------------------------------------------------
+KLINE_RANGES = {"近 3 個月": 63, "近 6 個月": 126, "近 1 年": 250}
+
+KLINE_TIPS = {
+    "錘形線": "出現在下跌段尾端，代表下方承接力道轉強、止跌回升機會高；隔日收紅或站上錘形線高點再進場較穩。",
+    "多頭吞噬": "紅K完全包覆前一根黑K，多方力道扭轉空勢，常是底部翻轉訊號；可分批進場。",
+    "早晨之星": "長黑、小K、長紅三根組合，空方力竭、多方反攻；第三根長紅確認時，或隔日逢低切入。",
+    "拉回買進": "上升趨勢中股價回檔至 10 日線或 20 日線附近且未破線，可趁回檔進場。",
+    "突破買進": "紅K帶量穿越前波高點，確認突破有效、成交量放大時順勢買進。",
+    "上吊線／射擊之星": "出現在波段高點，代表上方賣壓沉重、買盤追價無力，視為警訊、準備減碼。",
+    "空頭吞噬": "黑K完全吞沒前一根紅K，多方攻勢被強力蓋過，往往是短線由多轉空的賣出訊號。",
+    "黃昏之星": "長紅、小K、長黑三根組合，多頭動能耗盡；長黑確認後應考慮獲利了結或退場。",
+    "跌破支撐／均線": "長黑K貫穿重要支撐或均線，短線趨勢改變；必須執行紀律停損或出場。",
+}
+
+
+def detect_kline_signals(df):
+    """掃描整段日K，回傳 (含均線的資料表, 訊號清單)。訊號：{idx, date, kind(entry/exit), name, detail, close, stop}。"""
+    d = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+    if len(d) < 30:
+        return d, []
+    for w in (5, 10, 20):
+        d[f"MA{w}"] = d["Close"].rolling(w).mean()
+    O, H, L, C, V = (d[k].to_numpy(float) for k in ("Open", "High", "Low", "Close", "Volume"))
+    MA5, MA10, MA20 = (d[f"MA{w}"].to_numpy(float) for w in (5, 10, 20))
+    body = np.abs(C - O)
+    top, bot = np.maximum(O, C), np.minimum(O, C)
+    rng, upper, lower = H - L, H - top, bot - L
+    avg_body = pd.Series(body).rolling(20).mean().to_numpy()
+    vol5 = pd.Series(V).shift(1).rolling(5).mean().to_numpy()
+
+    sigs = []
+
+    def add(i, kind, name, extra="", stop=None):
+        sigs.append(
+            {
+                "idx": i,
+                "date": d.index[i],
+                "kind": kind,
+                "name": name,
+                "detail": KLINE_TIPS[name] + (f"（{extra}）" if extra else ""),
+                "close": float(C[i]),
+                "stop": None if stop is None else float(stop),
+            }
+        )
+
+    for i in range(25, len(d)):
+        if rng[i] <= 0 or not np.isfinite(MA20[i]) or not np.isfinite(avg_body[i]):
+            continue
+        ret5 = C[i - 1] / C[i - 6] - 1
+        down = ret5 < -0.02 and C[i - 1] < MA10[i - 1]
+        up = ret5 > 0.02 and C[i - 1] > MA10[i - 1]
+        down_soft, up_soft = C[i - 1] < MA10[i - 1], C[i - 1] > MA10[i - 1]
+        near_low = L[i] <= L[i - 10:i].min() * 1.03
+        near_high = H[i] >= H[i - 20:i].max() * 0.98
+        vr = V[i] / vol5[i] if np.isfinite(vol5[i]) and vol5[i] > 0 else np.nan
+        long_lower = lower[i] >= 2 * body[i] and lower[i] >= 0.6 * rng[i] and upper[i] <= 0.2 * rng[i]
+        long_upper = upper[i] >= 2 * body[i] and upper[i] >= 0.6 * rng[i] and lower[i] <= 0.2 * rng[i]
+
+        # ---------------- 進場 ----------------
+        if long_lower and down and near_low:
+            add(i, "entry", "錘形線", "長下影線出現在下跌段低檔", stop=L[i])
+        if (
+            C[i - 1] < O[i - 1] and C[i] > O[i] and O[i] <= C[i - 1] and C[i] >= O[i - 1]
+            and body[i] > body[i - 1] and down_soft
+        ):
+            add(i, "entry", "多頭吞噬", "紅K吞沒前一根黑K", stop=min(L[i], L[i - 1]))
+        if (
+            C[i - 2] < O[i - 2] and body[i - 2] >= avg_body[i] and C[i - 2] < MA10[i - 2]
+            and body[i - 1] <= 0.5 * avg_body[i] and top[i - 1] <= C[i - 2]
+            and C[i] > O[i] and body[i] >= avg_body[i] and C[i] > (O[i - 2] + C[i - 2]) / 2
+        ):
+            add(i, "entry", "早晨之星", "第三根長紅已確認", stop=min(L[i - 2:i + 1]))
+        uptrend = MA5[i] > MA10[i] > MA20[i] and MA20[i] > MA20[i - 3]
+        near10 = L[i] <= MA10[i] * 1.015 and C[i] >= MA10[i] * 0.99
+        near20 = L[i] <= MA20[i] * 1.015 and C[i] >= MA20[i]
+        if uptrend and (near10 or near20) and C[i] < C[i - 5:i].max():
+            add(i, "entry", "拉回買進", "回測 10 日線未破" if near10 else "回測 20 日線未破", stop=MA20[i] * 0.99)
+        if C[i] > O[i] and C[i] > H[i - 20:i].max() and np.isfinite(vr) and vr >= 1.5:
+            add(i, "entry", "突破買進", f"突破近 20 日高點，成交量為 5 日均量 {vr:.1f} 倍", stop=H[i - 20:i].max())
+
+        # ---------------- 出場 ----------------
+        if up and near_high and (long_lower or long_upper):
+            add(i, "exit", "上吊線／射擊之星", "長下影（上吊線）" if long_lower else "長上影（射擊之星）")
+        if (
+            C[i - 1] > O[i - 1] and C[i] < O[i] and O[i] >= C[i - 1] and C[i] <= O[i - 1]
+            and body[i] > body[i - 1] and up_soft
+        ):
+            add(i, "exit", "空頭吞噬", "黑K吞沒前一根紅K")
+        if (
+            C[i - 2] > O[i - 2] and body[i - 2] >= avg_body[i] and C[i - 2] > MA10[i - 2]
+            and body[i - 1] <= 0.5 * avg_body[i] and bot[i - 1] >= C[i - 2]
+            and C[i] < O[i] and body[i] >= avg_body[i] and C[i] < (O[i - 2] + C[i - 2]) / 2
+        ):
+            add(i, "exit", "黃昏之星", "第三根長黑已確認")
+        if C[i] < O[i] and body[i] >= avg_body[i]:
+            broke = []
+            if C[i] < MA10[i] and C[i - 1] >= MA10[i - 1]:
+                broke.append("跌破 10 日線")
+            if C[i] < L[i - 10:i].min():
+                broke.append("跌破近 10 日低點")
+            if C[i] < MA5[i] and C[i - 1] >= MA5[i - 1] and np.isfinite(vr) and vr >= 1.5:
+                broke.append("爆量跌破 5 日線")
+            if broke:
+                add(i, "exit", "跌破支撐／均線", "、".join(broke))
+    return d, sigs
+
+
+def _describe_last_bar(d):
+    o, h, l, c = (float(d[k].iloc[-1]) for k in ("Open", "High", "Low", "Close"))
+    body, rng = abs(c - o), h - l
+    avg_body = float((d["Close"] - d["Open"]).abs().tail(20).mean())
+    if rng <= 0:
+        return "一字K（無波動）"
+    if body <= 0.1 * rng:
+        kind = "十字K（多空拉鋸）"
+    elif c > o:
+        kind = "長紅K（買盤強勁）" if body >= avg_body else "紅K"
+    else:
+        kind = "長黑K（賣壓沉重）" if body >= avg_body else "黑K"
+    notes = []
+    if (min(o, c) - l) >= 2 * max(body, rng * 0.05):
+        notes.append("長下影線")
+    if (h - max(o, c)) >= 2 * max(body, rng * 0.05):
+        notes.append("長上影線")
+    return kind + ("，" + "、".join(notes) if notes else "")
+
+
+# ---------------------------------------------------------------------------
+# 下個交易日預測：把 K 線訊號、均線、MACD、RSI、量價、乖離率加權成 -100～+100 的分數
+# （規則式評分，不是保證漲跌；並用這檔股票過去一年的資料回測同樣判斷的隔日表現當參考）
+# ---------------------------------------------------------------------------
+PRED_THRESHOLD = 25
+
+
+def _prepare_indicators(d):
+    c = d["Close"]
+    delta = c.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    d["RSI"] = (100 - 100 / (1 + rs)).fillna(100)
+    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    d["MACD_H"] = macd - macd.ewm(span=9, adjust=False).mean()
+    d["VR"] = d["Volume"] / d["Volume"].shift(1).rolling(5).mean()
+    d["OBV"] = (np.sign(c.diff()).fillna(0) * d["Volume"]).cumsum()  # 能量潮：價漲加量、價跌減量
+    return d
+
+
+def _pv_score(A, i):
+    """量價關係評分（最多 ±20）：價量配合、價量背離（OBV）、爆量長影線。回傳 (分數, [(加減分, 理由)])。"""
+    vr = A["VR"][i]
+    if i < 21 or not np.isfinite(vr):
+        return 0, []
+    out = []
+    c, pc = A["Close"][i], A["Close"][i - 1]
+    o, h, l = A["Open"][i], A["High"][i], A["Low"][i]
+    rng = h - l
+    prev20_hi, prev20_lo = A["Close"][i - 20:i].max(), A["Close"][i - 20:i].min()
+    near_high, near_low = c >= prev20_hi * 0.98, c <= prev20_lo * 1.02
+
+    # 價量配合
+    if c > pc and vr >= 1.3:
+        out.append((10 if vr >= 2 else 8, f"價漲量增（成交量為 5 日均量 {vr:.1f} 倍），買盤積極、價量配合"))
+    elif c < pc and vr >= 1.3:
+        out.append((-10 if vr >= 2 else -8, f"價跌量增（成交量為 5 日均量 {vr:.1f} 倍），賣壓沉重"))
+    elif c > pc and vr <= 0.7 and near_high:
+        out.append((-6, f"價漲量縮（僅 5 日均量 {vr:.1f} 倍）且逼近高點，追價意願不足，留意背離"))
+    elif c < pc and vr <= 0.7 and c > A["MA20"][i]:
+        out.append((3, f"價跌量縮（僅 5 日均量 {vr:.1f} 倍）且仍在 20 日線上，賣壓輕、屬健康回檔"))
+
+    # 價量背離：價創 20 日新高／新低，但 OBV 沒跟上
+    obv, obv_win = A["OBV"][i], A["OBV"][i - 20:i]
+    if c >= prev20_hi and obv < obv_win.max():
+        out.append((-6, "股價創 20 日新高，但能量潮（OBV）未同步創高，價量背離，漲勢恐難持續"))
+    elif c <= prev20_lo and obv > obv_win.min():
+        out.append((6, "股價創 20 日新低，但能量潮（OBV）未同步創低，賣壓遞減，有止跌跡象"))
+
+    # 爆量長影線
+    if rng > 0 and vr >= 2:
+        upper, lower = h - max(o, c), min(o, c) - l
+        if upper >= 0.5 * rng and near_high:
+            out.append((-6, f"高檔爆量（{vr:.1f} 倍）收長上影線，上檔賣壓大、疑似出貨"))
+        elif lower >= 0.5 * rng and near_low:
+            out.append((6, f"低檔爆量（{vr:.1f} 倍）收長下影線，下檔承接力強、疑似止跌"))
+
+    total = max(-20, min(20, sum(p for p, _ in out)))
+    return total, out
+
+
+def _inst_score(table, vol_lots_by_date=None):
+    """三大法人買賣超評分（最多 ±20）：外資／投信連買連賣、當日買賣超佔成交量比、近 5 日方向、外資投信同向。"""
+    if table is None or table.empty or len(table) < 3:
+        return 0, []
+    out = []
+
+    def streak_pts(n, full, mid, low):
+        return full if n >= 5 else mid if n >= 3 else low
+
+    f_dir, f_n = _streak(table["外資"])
+    if f_dir and f_n >= 2:
+        pts = f_dir * streak_pts(f_n, 8, 6, 3)
+        out.append((pts, f"外資連續 {f_n} 日{'買超' if f_dir > 0 else '賣超'}"))
+    t_dir, t_n = _streak(table["投信"])
+    if t_dir and t_n >= 2:
+        pts = t_dir * (7 if t_n >= 3 else 4)
+        out.append((pts, f"投信連續 {t_n} 日{'買超' if t_dir > 0 else '賣超'}（投信作帳力道常帶動中小型股）"))
+
+    total = table["三大法人合計"]
+    last = float(total.iloc[-1])
+    lots = (vol_lots_by_date or {}).get(table.index[-1])
+    if lots and lots > 0:
+        ratio = last / lots * 100
+        if abs(ratio) >= 5:
+            out.append((6 if ratio > 0 else -6, f"{table.index[-1]} 三大法人{'買超' if ratio > 0 else '賣超'}佔成交量 {abs(ratio):.1f}%，籌碼明顯{'集中' if ratio > 0 else '鬆動'}"))
+        elif abs(ratio) >= 2:
+            out.append((3 if ratio > 0 else -3, f"{table.index[-1]} 三大法人{'買超' if ratio > 0 else '賣超'}佔成交量 {abs(ratio):.1f}%"))
+    s5 = float(total.tail(5).sum())
+    if s5:
+        out.append((3 if s5 > 0 else -3, f"近 5 日三大法人合計{'買超' if s5 > 0 else '賣超'} {abs(s5):,.0f} 張"))
+    f_last, t_last = float(table["外資"].iloc[-1]), float(table["投信"].iloc[-1])
+    if f_last > 0 and t_last > 0:
+        out.append((4, "最新一日外資與投信同步買超，土洋合力"))
+    elif f_last < 0 and t_last < 0:
+        out.append((-4, "最新一日外資與投信同步賣超，土洋同步倒貨"))
+
+    return max(-20, min(20, sum(p for p, _ in out))), out
+
+
+def _score_at(A, by, i, inst=None):
+    """第 i 根K線收盤後的評分。回傳 (分數, [(加減分, 理由)])。inst 為 (法人分數, 理由)，只在最新一天使用。"""
+    reasons = []
+    c, m5, m10, m20 = A["Close"][i], A["MA5"][i], A["MA10"][i], A["MA20"][i]
+
+    # 1) K 線型態（最近 3 根，越新權重越高，合計最多 ±30）
+    k_sum = 0
+    for lag, w, label in ((0, 20, "今天"), (1, 12, "昨天"), (2, 6, "前天")):
+        for s in by.get(i - lag, []):
+            pts = w if s["kind"] == "entry" else -w
+            k_sum += pts
+            kind = "進場" if s["kind"] == "entry" else "出場"
+            reasons.append((pts, f"{label}出現{kind}訊號「{s['name']}」"))
+    k_total = max(-30, min(30, k_sum))
+
+    total = k_total
+    # 2) 均線排列與 20 日線方向
+    if c > m5 > m10 > m20:
+        pts, txt = 15, "收盤 > 5日線 > 10日線 > 20日線，多頭排列"
+    elif c < m5 < m10 < m20:
+        pts, txt = -15, "收盤 < 5日線 < 10日線 < 20日線，空頭排列"
+    elif c > m20:
+        pts, txt = 5, "收盤站在 20 日線之上"
+    else:
+        pts, txt = -5, "收盤在 20 日線之下"
+    total += pts
+    reasons.append((pts, txt))
+    up20 = m20 > A["MA20"][i - 3]
+    total += 5 if up20 else -5
+    reasons.append((5 if up20 else -5, "20 日線向上，中期趨勢偏多" if up20 else "20 日線向下，中期趨勢偏空"))
+
+    # 3) MACD 柱狀體
+    h, hp = A["MACD_H"][i], A["MACD_H"][i - 1]
+    if h > 0:
+        pts = 8 + (4 if h > hp else 0)
+        txt = "MACD 柱狀體為正" + ("且持續擴大，多方動能增強" if h > hp else "，但動能略為收斂")
+    else:
+        pts = -(8 + (4 if h < hp else 0))
+        txt = "MACD 柱狀體為負" + ("且持續擴大，空方動能增強" if h < hp else "，但跌勢略為收斂")
+    total += pts
+    reasons.append((pts, txt))
+
+    # 4) RSI
+    r = A["RSI"][i]
+    if r < 30:
+        pts, txt = 8, f"RSI {r:.0f} 低於 30，超賣區有反彈機會"
+    elif r >= 75:
+        pts, txt = -10, f"RSI {r:.0f} 高於 75，嚴重過熱，回檔風險高"
+    elif r >= 70:
+        pts, txt = -6, f"RSI {r:.0f} 進入過熱區（70 以上）"
+    else:
+        pts = int(round((r - 50) / 4))
+        txt = f"RSI {r:.0f}，{'偏強' if pts > 0 else '偏弱'}"
+    if pts:
+        total += pts
+        reasons.append((pts, txt))
+
+    # 5) 量價關係
+    pv_pts, pv_reasons = _pv_score(A, i)
+    total += pv_pts
+    reasons.extend(pv_reasons)
+
+    # 6) 與 20 日線的乖離
+    bias = (c / m20 - 1) * 100
+    if bias > 10:
+        total -= 8
+        reasons.append((-8, f"股價高於 20 日線 {bias:.1f}%，乖離過大，容易拉回"))
+    elif bias < -10:
+        total += 6
+        reasons.append((6, f"股價低於 20 日線 {abs(bias):.1f}%，超跌乖離，有反彈空間"))
+
+    # 7) 三大法人買賣超（只有近 10 個交易日資料，因此只用在最新一天的預測）
+    if inst and inst[1]:
+        total += inst[0]
+        reasons.extend(inst[1])
+
+    return int(max(-100, min(100, total))), reasons
+
+
+def _prediction_pack(d, sigs):
+    d = _prepare_indicators(d.copy())
+    A = {k: d[k].to_numpy(float) for k in ("Open", "Close", "High", "Low", "MA5", "MA10", "MA20", "RSI", "MACD_H", "VR", "OBV")}
+    by = {}
+    for s in sigs:
+        by.setdefault(s["idx"], []).append(s)
+    return d, A, by
+
+
+def _render_prediction(d, sigs, inst_table=None):
+    d, A, by = _prediction_pack(d, sigs)
+    n = len(d)
+    i = n - 1
+    vol_lots = {ix.strftime("%Y-%m-%d"): float(v) / 1000 for ix, v in d["Volume"].items()}
+    inst = _inst_score(inst_table, vol_lots)
+    score, reasons = _score_at(A, by, i, inst)
+
+    # 下一個交易日（只跳過週末，不含國定假日）
+    nd = d.index[-1] + datetime.timedelta(days=1)
+    while nd.weekday() >= 5:
+        nd += datetime.timedelta(days=1)
+    nd_txt = f"{nd.strftime('%Y-%m-%d')}（週{'一二三四五六日'[nd.weekday()]}）"
+
+    st.markdown("##### 🔮 下個交易日預測")
+    strength = "強烈" if abs(score) >= 50 else "偏"
+    if score >= PRED_THRESHOLD:
+        st.success(f"🔼 {nd_txt}：{strength}多，**適合進場**（已持有者可續抱）")
+        verdict = "bull"
+    elif score <= -PRED_THRESHOLD:
+        st.error(f"🔽 {nd_txt}：{strength}空，**適合出場／減碼**（空手者不宜進場）")
+        verdict = "bear"
+    else:
+        st.info(f"⚪ {nd_txt}：多空訊號不明確，**建議觀望**")
+        verdict = "neutral"
+
+    close = float(A["Close"][i])
+    sup = [v for v in (A["MA5"][i], A["MA10"][i], A["MA20"][i], A["Low"][i - 10:i].min()) if v < close]
+    res = [v for v in (A["MA5"][i], A["MA10"][i], A["MA20"][i], A["High"][i - 20:i].max()) if v > close]
+    support = max(sup) if sup else float(A["Low"][i - 10:i].min())
+    resist = min(res) if res else float(A["High"][i - 20:i].max())
+    m1, m2, m3 = st.columns(3)
+    m1.metric("預測分數（-100～+100）", f"{score:+d}")
+    m2.metric("下方支撐（跌破轉弱）", f"{support:.2f}")
+    m3.metric("上方壓力（突破轉強）", f"{resist:.2f}")
+    st.progress((score + 100) / 200)
+    st.caption(f"分數 ≥ +{PRED_THRESHOLD} 偏多、≤ -{PRED_THRESHOLD} 偏空，其餘觀望。")
+
+    # 因子分項
+    pv_pts, _ = _pv_score(A, i)
+    k_pts = score - pv_pts - inst[0]
+    f1, f2, f3 = st.columns(3)
+    f1.metric("技術面（K線／均線／指標）", f"{k_pts:+d}")
+    f2.metric("量價關係", f"{pv_pts:+d}")
+    f3.metric("三大法人籌碼", f"{inst[0]:+d}" if inst[1] else "無資料")
+    if inst_table is not None and not inst_table.empty:
+        if inst_table.index[-1] != d.index[-1].strftime("%Y-%m-%d"):
+            st.caption(f"ℹ️ 法人資料最新為 {inst_table.index[-1]}（當日資料可能尚未公布），籌碼因子以此日為準。")
+    else:
+        st.caption("ℹ️ 未取得三大法人資料（非台股或來源暫時無法連線），本次預測只含技術面與量價。")
+
+    # 理由（依影響力大小排序）
+    st.markdown("**判斷理由**")
+    for pts, txt in sorted(reasons, key=lambda x: -abs(x[0])):
+        st.markdown(f"- {'🔴 ➕' if pts > 0 else '🟢 ➖'} `{pts:+d}`　{txt}")
+
+    # 隔日進出場參考（用近 14 日平均真實波幅 ATR 估算當日合理波動）
+    H_, L_, C_ = A["High"], A["Low"], A["Close"]
+    tr = np.maximum(H_[1:] - L_[1:], np.maximum(np.abs(H_[1:] - C_[:-1]), np.abs(L_[1:] - C_[:-1])))
+    atr = float(tr[-14:].mean())
+    st.markdown("**📌 隔日進出場參考**")
+    if verdict == "bull":
+        st.markdown(
+            f"- 📈 **進場**：開盤後回測 **{close - 0.5 * atr:.2f}～{close:.2f}** 分批買進；若開盤直接跳空超過 **{close + atr:.2f}** 不追價。\n"
+            f"- 🛡️ **停損**：跌破 **{support:.2f}** 出場。\n"
+            f"- 🎯 **第一目標／壓力**：**{resist:.2f}** 附近，量縮不過可先減碼。"
+        )
+    elif verdict == "bear":
+        st.markdown(
+            f"- 📉 **出場／減碼**：開盤逢反彈 **{close:.2f}～{close + 0.5 * atr:.2f}** 先賣；若開盤直接跌破 **{close - atr:.2f}** 不宜再凹單。\n"
+            f"- 🛡️ **全數出場**：跌破 **{support:.2f}**。\n"
+            f"- 🔄 **空手者**：站回 **{resist:.2f}** 且量能放大，才重新考慮進場。"
+        )
+    else:
+        st.markdown(
+            f"- 👀 **進場條件**：收盤站上 **{resist:.2f}** 且成交量放大（≥ 5 日均量 1.5 倍）再進場。\n"
+            f"- 🚪 **出場條件**：收盤跌破 **{support:.2f}** 就減碼／出場。\n"
+            f"- ⏳ 區間內（{support:.2f}～{resist:.2f}）不動作，等方向。"
+        )
+
+    # 回測：這檔股票過去同樣判斷，隔天實際表現
+    stats = {"bull": [], "bear": []}
+    for k in range(30, n - 1):
+        sc, _ = _score_at(A, by, k)
+        nxt = A["Close"][k + 1] / A["Close"][k] - 1
+        if sc >= PRED_THRESHOLD:
+            stats["bull"].append(nxt)
+        elif sc <= -PRED_THRESHOLD:
+            stats["bear"].append(nxt)
+    if verdict in stats:
+        arr = np.array(stats[verdict])
+        if len(arr) >= 5:
+            if verdict == "bull":
+                hit, word = (arr > 0).mean() * 100, "上漲"
+            else:
+                hit, word = (arr < 0).mean() * 100, "下跌"
+            st.caption(
+                f"📊 歷史參考：這檔股票過去約一年，出現同樣判斷 {len(arr)} 次，隔天{word}的比例 {hit:.0f}%，"
+                f"隔日平均漲跌 {arr.mean() * 100:+.2f}%。"
+            )
+        else:
+            st.caption("📊 歷史參考：過去一年同樣判斷的次數太少（不足 5 次），無法回測參考。")
+    st.caption("（回測只含技術面與量價因子；法人資料只取得近 10 個交易日，無法回測整年。）")
+    if inst_table is not None and not inst_table.empty:
+        with st.expander("🏦 三大法人近期買賣超明細（張）"):
+            st.dataframe(inst_table.sort_index(ascending=False), width="stretch")
+    st.caption(
+        "⚠️ 這是依技術指標加權評分的「規則式判斷」，不是保證漲跌的預測；"
+        "隔日走勢還受消息面、大盤與籌碼影響。回測為過去資料，不代表未來，請務必搭配停損。"
+    )
+
+
+def _kline_start():
+    """按下「開始分析」（或在輸入框按 Enter）：記下要分析的對象，之後每次重繪都用這份紀錄。"""
+    kw = st.session_state.get("kline_input", "").strip()
+    default_symbol = st.session_state.get("trigger_search", "")
+    if default_symbol.startswith("FAILED:"):
+        default_symbol = ""
+    st.session_state.kline_req = (kw, default_symbol)
+
+
+def render_kline_analysis():
+    st.markdown("##### 📐 K線分析：用型態判斷進出場時機")
+    mobile_ = is_mobile()
+    c1, c2 = (st.container(), st.container()) if mobile_ else st.columns([3, 1], vertical_alignment="bottom")
+    with c1:
+        st.text_input(
+            "股票代號或中文名稱（留白＝使用「個股分析」目前查詢的股票）",
+            key="kline_input",
+            on_change=_kline_start,  # 按 Enter 也會開始分析
+        )
+    with c2:
+        st.button("📐 開始分析", type="primary", key="kline_btn", on_click=_kline_start,
+                  width="stretch" if mobile_ else "content")
+    range_label = st.radio("圖表區間", list(KLINE_RANGES), index=1, horizontal=True, key="kline_range")
+
+    req = st.session_state.get("kline_req")
+    if req is None:
+        st.info("請輸入股票代號或名稱後按「開始分析」；留白則分析「個股分析」目前查詢的股票。")
+        return
+    kw, default_symbol = req
+    target = kw or default_symbol
+    if not target:
+        st.info("請輸入股票代號或名稱，或先在「個股分析」查詢一檔股票。")
+        return
+
+    with st.spinner("⏳ 載入資料中，請稍候…"):
+        symbol = get_ticker_from_name(target) if kw else default_symbol
+        hist, valid = pd.DataFrame(), None
+        for cand in [symbol] + ([symbol[:-3] + ".TWO"] if symbol.endswith(".TW") else []):
+            try:
+                hist = fetch_history(cand, "1y")
+            except Exception:
+                continue
+            if not hist.empty:
+                valid = cand
+                break
+        if valid is None:
+            st.error(f"❌ 找不到「{target}」的股價資料。")
+            return
+        name = resolve_display_name(valid, kw)
+        d, sigs = detect_kline_signals(hist)
+
+    if len(d) < 30:
+        st.warning("歷史資料不足 30 個交易日，無法判斷 K 線型態。")
+        return
+
+    n, window = len(d), KLINE_RANGES[range_label]
+    last, prev = d.iloc[-1], d.iloc[-2]
+    chg = float(last["Close"] - prev["Close"])
+    ma5, ma10, ma20 = (float(last[f"MA{w}"]) for w in (5, 10, 20))
+    close = float(last["Close"])
+    if close > ma5 > ma10 > ma20:
+        trend = "多頭排列"
+    elif close < ma5 < ma10 < ma20:
+        trend = "空頭排列"
+    else:
+        trend = "盤整／趨勢未明"
+
+    st.subheader(f"{name} ({valid})")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("最新收盤", f"{close:.2f}", f"{chg:+.2f} ({chg / float(prev['Close']) * 100:+.2f}%)", delta_color="inverse")
+    m2.metric("5 / 10 日線", f"{ma5:.2f} / {ma10:.2f}")
+    m3.metric("20 日線", f"{ma20:.2f}")
+    m4.metric("均線型態", trend)
+    st.caption(f"📌 最新一根K線（{d.index[-1].strftime('%Y-%m-%d')}）：{_describe_last_bar(d)}")
+
+    # --- 目前判斷（看最近 3 個交易日的訊號）---
+    recent = [s for s in sigs if s["idx"] >= n - 3]
+    buys = [s for s in recent if s["kind"] == "entry"]
+    sells = [s for s in recent if s["kind"] == "exit"]
+
+    def _names(lst):
+        return "、".join(f"{s['name']}（{s['date'].strftime('%m/%d')}）" for s in lst)
+
+    if buys and sells:
+        st.warning(
+            f"⚖️ 最近 3 個交易日多空訊號並存：進場 {_names(buys)}；出場 {_names(sells)}。"
+            "方向不明，建議觀望，等下一根K線確認。"
+        )
+    elif sells:
+        st.error(
+            f"⚠️ 最近 3 個交易日出現出場／減碼訊號：{_names(sells)}。"
+            "持股者可考慮減碼或獲利了結，並嚴守停損紀律。"
+        )
+    elif buys:
+        stops = [s["stop"] for s in buys if s["stop"]]
+        stop_txt = f"停損參考 {min(stops):.2f}（跌破即出場）。" if stops else ""
+        st.success(
+            f"🔔 最近 3 個交易日出現進場訊號：{_names(buys)}。建議等確認後分批進場。{stop_txt}"
+        )
+    else:
+        tips = {
+            "多頭排列": "目前沒有新的K線訊號，趨勢仍偏多：持股續抱，等拉回 10 日線／20 日線不破再找進場點。",
+            "空頭排列": "目前沒有新的K線訊號，趨勢偏空：不宜貿然進場，等待止跌型態（錘形線、多頭吞噬、早晨之星）。",
+            "盤整／趨勢未明": "目前沒有明確的K線訊號，趨勢未明：先觀望，等突破或跌破區間再行動。",
+        }
+        st.info("💡 " + tips[trend])
+
+    inst_table = None
+    if valid.endswith((".TW", ".TWO")):
+        with st.spinner("⏳ 載入法人資料中，請稍候…"):
+            try:
+                inst_table = fetch_institutional_official(valid, days=10)
+            except Exception:
+                try:
+                    inst_table = summarize_institutional(fetch_institutional_raw(valid.split(".")[0]), days=10)
+                except Exception:
+                    inst_table = None
+    _render_prediction(d, sigs, inst_table)
+
+    # --- K 線圖 + 訊號標記 ---
+    start = max(0, n - window)
+    shown = d.iloc[start:]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Candlestick(
+            x=shown.index, open=shown["Open"], high=shown["High"], low=shown["Low"], close=shown["Close"],
+            name="K線", increasing_line_color="red", decreasing_line_color="green",
+        )
+    )
+    for w, color in ((5, "#ffd166"), (10, "#4cc9f0"), (20, "#c77dff")):
+        fig.add_trace(
+            go.Scatter(x=shown.index, y=shown[f"MA{w}"], mode="lines", name=f"{w}日線", line=dict(width=1.2, color=color))
+        )
+    for kind, label, symbol_, color, pos, y_mult, col in (
+        ("entry", "進場訊號", "triangle-up", "#ff9f1c", "bottom center", 0.985, "Low"),
+        ("exit", "出場訊號", "triangle-down", "#2ec4b6", "top center", 1.015, "High"),
+    ):
+        pts = {}
+        for s in sigs:
+            if s["kind"] == kind and s["idx"] >= start:
+                pts.setdefault(s["idx"], []).append(s)
+        if pts:
+            xs = [d.index[i] for i in pts]
+            ys = [float(d[col].iloc[i]) * y_mult for i in pts]
+            fig.add_trace(
+                go.Scatter(
+                    x=xs, y=ys, mode="markers+text", name=label,
+                    marker=dict(symbol=symbol_, size=12, color=color),
+                    text=["/".join(s["name"] for s in v) for v in pts.values()],
+                    textposition=pos, textfont=dict(size=10, color=color),
+                    hovertext=["<br>".join(f"{s['name']}：{s['detail']}" for s in v) for v in pts.values()],
+                    hoverinfo="x+text",
+                )
+            )
+    fig.update_layout(
+        title=f"{name} K 線與進出場訊號", template="plotly_dark",
+        xaxis_rangeslider_visible=False, xaxis_title="日期", yaxis_title="價格",
+    )
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    show_chart(fig)
+
+    # --- 訊號明細 ---
+    shown_sigs = [s for s in sigs if s["idx"] >= start]
+    st.markdown(f"**📋 {range_label}訊號明細**（共 {len(shown_sigs)} 筆，新 → 舊）")
+    if shown_sigs:
+        css = (
+            "<style>.kl-wrap{max-height:520px;overflow:auto;border:1px solid rgba(128,128,128,.35);border-radius:8px}"
+            ".kl-wrap table{border-collapse:collapse;width:100%;font-size:0.9rem}"
+            ".kl-wrap th{text-align:left;padding:8px 10px;background:rgba(128,128,128,.18);white-space:nowrap}"
+            ".kl-wrap td{padding:8px 10px;border-top:1px solid rgba(128,128,128,.25);vertical-align:top}"
+            ".kl-wrap td.n{text-align:right;white-space:nowrap}"
+            ".kl-wrap td.t{min-width:280px;line-height:1.5}</style>"
+        )
+        rows_html = []
+        for s_ in reversed(shown_sigs):
+            entry = s_["kind"] == "entry"
+            color = "#ff9f1c" if entry else "#2ec4b6"
+            stop = "—" if s_["stop"] is None else f"{s_['stop']:.2f}"
+            rows_html.append(
+                f"<tr><td style='white-space:nowrap'>{s_['date'].strftime('%Y-%m-%d')}</td>"
+                f"<td style='white-space:nowrap;color:{color}'>{'📈 進場' if entry else '📉 出場'}</td>"
+                f"<td style='white-space:nowrap'>{html_escape(s_['name'])}</td>"
+                f"<td class='n'>{s_['close']:.2f}</td><td class='n'>{stop}</td>"
+                f"<td class='t'>{html_escape(s_['detail'])}</td></tr>"
+            )
+        head = "".join(f"<th>{h}</th>" for h in ("日期", "訊號", "型態", "收盤價", "停損參考", "操作解讀"))
+        st.markdown(
+            css + f"<div class='kl-wrap'><table><thead><tr>{head}</tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("此區間內沒有偵測到明確的K線訊號。")
+
+    with st.expander("📖 型態說明與判斷條件"):
+        st.markdown(
+            """
+**進場時機**
+
+| 型態 | 判斷條件（本頁的程式規則） | 操作 |
+|---|---|---|
+| 錘形線 | 下影線 ≥ 實體 2 倍且佔全日振幅 6 成以上、上影線很短；出現在下跌後的近期低點 | 下跌段尾端，止跌回升機會高 |
+| 多頭吞噬 | 前一天黑K、當天紅K實體更大並完全包覆；前一天收在 10 日線下 | 底部翻轉訊號 |
+| 早晨之星 | 長黑 → 小K（實體不高於第一根收盤）→ 長紅，且收在第一根實體中點之上 | 第三根長紅確認時或隔日逢低切入 |
+| 拉回買進 | 5 > 10 > 20 日線多頭排列、20 日線上揚；回檔觸及 10 或 20 日線附近但收盤未破線 | 上升趨勢中回檔進場 |
+| 突破買進 | 紅K收盤突破近 20 日最高價，且成交量 ≥ 5 日均量 1.5 倍 | 突破有效、量增時順勢買進 |
+
+**出場時機**
+
+| 型態 | 判斷條件（本頁的程式規則） | 操作 |
+|---|---|---|
+| 上吊線／射擊之星 | 長下影（上吊線）或長上影（射擊之星），出現在上漲後的近期高點 | 賣壓沉重，準備減碼 |
+| 空頭吞噬 | 前一天紅K、當天黑K實體更大並完全吞沒；前一天收在 10 日線上 | 短線由多轉空 |
+| 黃昏之星 | 長紅 → 小K（實體不低於第一根收盤）→ 長黑，且收在第一根實體中點之下 | 獲利了結或退場 |
+| 跌破支撐／均線 | 長黑K跌破 10 日線、近 10 日低點，或爆量跌破 5 日線 | 紀律停損或出場 |
+
+「長紅／長黑」＝實體大於近 20 日平均實體。
+
+**下個交易日預測的評分因子（-100～+100）**
+
+| 因子 | 內容 | 最大影響 |
+|---|---|---|
+| K線型態 | 近 3 日進出場訊號，越新權重越高 | ±30 |
+| 均線／MACD／RSI／乖離 | 趨勢排列、動能、過熱或超跌 | 約 ±40 |
+| 量價關係 | 價漲量增、價跌量增、價漲量縮背離、OBV 背離、高低檔爆量長影線 | ±20 |
+| 三大法人 | 外資／投信連買連賣、買賣超佔成交量比、近 5 日方向、土洋同向 | ±20 |
+            """
+        )
+    st.caption("⚠️ K線型態只是技術面參考，容易有假訊號，請搭配成交量、大盤與基本面，並設好停損；本頁不構成投資建議。")
+
+
+# ---------------------------------------------------------------------------
+# 主畫面：輸入區
+# ---------------------------------------------------------------------------
+tab_stock, tab_kline, tab_rank, tab_inst = st.tabs(
+    ["🔍 個股分析", "📐 K線分析", "🔥 即時市場排行", "🏦 前一交易日買超賣超"]
+)
+
+# K線分析頁籤：輸入欄位不需連線，先渲染，打開就看得到（不必等其他頁籤載入完）
+with tab_kline:
+    render_kline_analysis()
 
 with tab_stock:
-    # ---------------------------------------------------------------------------
-    # 主畫面：輸入區
-    # ---------------------------------------------------------------------------
     mobile = is_mobile()
     if mobile:
         # 手機：輸入框與按鈕由上而下全寬排列
@@ -2401,65 +3438,70 @@ with tab_stock:
     if pending:
         st.session_state.pending_search = ""
         with result_slot.container():
-            with st.spinner(f"⏳ 搜尋「{pending}」中，請稍候…"):
+            with st.spinner(f"⏳ 載入「{pending}」資料中，請稍候…"):
                 run_search(pending)
 
-    # ---------------------------------------------------------------------------
-    # 側邊欄：搜尋紀錄
-    # ---------------------------------------------------------------------------
-    with st.sidebar:
-        st.header("🕒 搜尋紀錄")
+# ---------------------------------------------------------------------------
+# 側邊欄：搜尋紀錄
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header("🕒 搜尋紀錄")
 
-        if st.session_state.search_history:
-            for i, (hist_name, hist_symbol) in enumerate(st.session_state.search_history):
-                col_btn, col_del = st.columns([4, 1])
-                with col_btn:
-                    st.button(
-                        f"🔍 {hist_name}",
-                        key=f"btn_{hist_symbol}_{i}",
-                        on_click=click_history_btn,
-                        args=(hist_symbol, hist_name),
-                        width="stretch",
-                    )
-                with col_del:
-                    st.button(
-                        "❌",
-                        key=f"del_{hist_symbol}_{i}",
-                        on_click=delete_single_history,
-                        args=(i,),
-                        width="stretch",
-                    )
+    if st.session_state.search_history:
+        for i, (hist_name, hist_symbol) in enumerate(st.session_state.search_history):
+            col_btn, col_del = st.columns([4, 1])
+            with col_btn:
+                st.button(
+                    f"🔍 {hist_name}",
+                    key=f"btn_{hist_symbol}_{i}",
+                    on_click=click_history_btn,
+                    args=(hist_symbol, hist_name),
+                    width="stretch",
+                )
+            with col_del:
+                st.button(
+                    "❌",
+                    key=f"del_{hist_symbol}_{i}",
+                    on_click=delete_single_history,
+                    args=(i,),
+                    width="stretch",
+                )
 
-            st.markdown("---")
-            if st.button("🗑️ 清除所有紀錄", type="primary", width="stretch"):
-                st.session_state.search_history = []
-                st.rerun()
-        else:
-            st.info("目前沒有搜尋紀錄")
-
-
-    trigger = st.session_state.trigger_search
-
-    if st.session_state.search_stopped:
-        result_slot.warning("⏹ 已停止搜尋。")
-
-    elif not trigger:
-        result_slot.info("👋 請在上方輸入股票代號或名稱，並點選「開始搜尋並分析」。")
-
-    elif trigger.startswith("FAILED:"):
-        failed_keyword = trigger.replace("FAILED:", "", 1)
-        with result_slot.container():
-            st.error(f"❌ 找不到「{failed_keyword}」的相關股票資料。請檢查輸入是否正確。")
-            if any("\u4e00" <= ch <= "\u9fff" for ch in failed_keyword) and not get_tw_names():
-                st.warning("⚠️ 目前無法連線取得台股中文名稱清單，請改輸入股票代號（例如 2383），或檢查網路連線。")
-
+        st.markdown("---")
+        if st.button("🗑️ 清除所有紀錄", type="primary", width="stretch"):
+            st.session_state.search_history = []
+            st.rerun()
     else:
-        with result_slot.container():
-            render_analysis(trigger.upper(), time_period)
-
-    stop_slot.empty()  # 載入完成，移除停止按鈕
+        st.info("目前沒有搜尋紀錄")
 
 
-# 市場排行放在最後執行：個股分析先完成顯示，排行資料較慢時不會卡住搜尋結果
-with tab_market:
-    render_market_tab()
+trigger = st.session_state.trigger_search
+
+if st.session_state.search_stopped:
+    result_slot.warning("⏹ 已停止搜尋。")
+
+elif not trigger:
+    result_slot.info("👋 歡迎使用股票分析儀！請在上方輸入股票代號或名稱，並點選「開始搜尋並分析」。")
+
+elif trigger.startswith("FAILED:"):
+    failed_keyword = trigger.replace("FAILED:", "", 1)
+    with result_slot.container():
+        st.error(f"❌ 找不到「{failed_keyword}」的相關股票資料。請檢查輸入是否正確。")
+        if any("\u4e00" <= ch <= "\u9fff" for ch in failed_keyword) and not get_tw_names():
+            st.warning("⚠️ 目前無法連線取得台股中文名稱清單，請改輸入股票代號（例如 2383），或檢查網路連線。")
+
+else:
+    with result_slot.container():
+        render_analysis(trigger.upper(), time_period)
+
+stop_slot.empty()  # 載入完成，移除停止按鈕
+
+
+# ---------------------------------------------------------------------------
+# 較慢的頁籤放最後渲染（需要連線抓大量資料），避免擋住前面頁籤的畫面
+# ---------------------------------------------------------------------------
+with tab_inst:
+    render_prev_day_institutional_rank()
+
+with tab_rank:
+    render_market_rank()
