@@ -2726,27 +2726,71 @@ def render_prev_day_institutional_rank():
 
 # ---------------------------------------------------------------------------
 # 頁籤四：K線分析（用 K 線型態判斷進出場時機）
-# 進場：錘形線、多頭吞噬、早晨之星、拉回買進、突破買進
-# 出場：上吊線／射擊之星、空頭吞噬、黃昏之星、跌破支撐／均線
+# 進場：錘形線、多頭吞噬（含量縮轉折紅K）、早晨之星、拉回買進、突破買進（含頸線）、回測頸線不破、回測大量支撐區
+# 出場：上吊線／射擊之星、空頭吞噬、黃昏之星、跌破支撐／均線（含大量區）、高檔爆量長黑、高檔量價背離
+# 每個訊號都附「建議進場價」與「停損／出場價」
 # 台股慣例：紅K＝收盤高於開盤，黑K＝收盤低於開盤
 # ---------------------------------------------------------------------------
 KLINE_RANGES = {"近 3 個月": 63, "近 6 個月": 126, "近 1 年": 250}
 
 KLINE_TIPS = {
     "錘形線": "出現在下跌段尾端，代表下方承接力道轉強、止跌回升機會高；隔日收紅或站上錘形線高點再進場較穩。",
-    "多頭吞噬": "紅K完全包覆前一根黑K，多方力道扭轉空勢，常是底部翻轉訊號；可分批進場。",
+    "多頭吞噬": "紅K完全包覆前一根黑K，多方力道扭轉空勢，常是底部翻轉訊號；可分批進場。若發生在量縮打底之後、今日帶量（低量轉折紅K），可靠度更高，可視為試單進場時機。",
     "早晨之星": "長黑、小K、長紅三根組合，空方力竭、多方反攻；第三根長紅確認時，或隔日逢低切入。",
     "拉回買進": "上升趨勢中股價回檔至 10 日線或 20 日線附近且未破線，可趁回檔進場。",
-    "突破買進": "紅K帶量穿越前波高點，確認突破有效、成交量放大時順勢買進。",
+    "突破買進": "紅K帶量穿越前波高點，確認突破有效、成交量放大時順勢買進；若同時帶量突破長期區間／W底頸線，為經典的積極進場點。",
     "上吊線／射擊之星": "出現在波段高點，代表上方賣壓沉重、買盤追價無力，視為警訊、準備減碼。",
     "空頭吞噬": "黑K完全吞沒前一根紅K，多方攻勢被強力蓋過，往往是短線由多轉空的賣出訊號。",
     "黃昏之星": "長紅、小K、長黑三根組合，多頭動能耗盡；長黑確認後應考慮獲利了結或退場。",
-    "跌破支撐／均線": "長黑K貫穿重要支撐或均線，短線趨勢改變；必須執行紀律停損或出場。",
+    "跌破支撐／均線": "長黑K貫穿重要支撐、均線或下檔大量支撐區，原先的支撐邏輯失效、轉為壓力；必須執行紀律停損或出場，不可抱持僥倖心態。",
+    "回測頸線不破": "股價帶量突破區間／W底頸線後，隔天或數日內回測頸線不跌破、量縮，是經典的積極進場點；若收盤跌回頸線之下代表突破失敗，立即停損。",
+    "回測大量支撐區": "依分價量統計，股價回測至下檔累積成交量最大的價位區，且量縮止穩、賣壓減輕，屬於低風險切入點；若被長黑有效跌破，支撐失效須停損。",
+    "高檔量價背離": "股價一波比一波高，但量能一波比一波小，連續出現三次以上價量背離，上攻動能耗盡；應分批獲利了結或調降持股水位。",
+    "高檔爆量長黑": "高檔區突然出現長黑K並伴隨巨量（恐慌出貨或主力倒貨），若隨後跌破短中期均線或上升趨勢，為強烈出場訊號，應果斷停利或停損。",
 }
 
 
+# 頸線／分價量判斷用的參數（想調整標準改這裡）
+VOL_PROFILE_WINDOW = 120   # 分價量統計：看近幾個交易日
+VOL_PROFILE_BINS = 24      # 分價量統計：價格區間切成幾格
+NECK_LOOKBACK = 60         # 頸線／大量區：前 60 日高點
+NECK_VOL_MULT = 1.5        # 突破時成交量需 ≥ 月均量（20 日）的幾倍
+NECK_MAX_RANGE = 0.45      # 前 60 日高低振幅 ≤ 45% 才視為「區間整理」後的突破
+NECK_STOP_PCT = 0.97       # 頸線停損：頸線下 3%
+ZONE_BREAK_PCT = 0.99      # 大量區有效跌破／停損：區間下緣再下 1%
+
+
+def _volume_nodes(H, L, C, V, i, window=VOL_PROFILE_WINDOW, bins=VOL_PROFILE_BINS):
+    """分價量統計：用 i 以前（不含 i）近 window 根K線，依典型價把成交量分到價格區間，
+    回傳成交量最集中的「大量區」[(下緣, 上緣, 佔比)]，由大到小最多 3 個。"""
+    s = max(0, i - window)
+    if i - s < 40:
+        return []
+    lo, hi = float(np.min(L[s:i])), float(np.max(H[s:i]))
+    vol = V[s:i]
+    if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo or vol.sum() <= 0:
+        return []
+    tp = (H[s:i] + L[s:i] + C[s:i]) / 3
+    hist, edges = np.histogram(tp, bins=bins, range=(lo, hi), weights=vol)
+    mask = hist >= 1.5 * hist.mean()
+    total = hist.sum()
+    zones, k = [], 0
+    while k < bins:
+        if mask[k]:
+            e = k
+            while e + 1 < bins and mask[e + 1]:
+                e += 1
+            zones.append((float(edges[k]), float(edges[e + 1]), float(hist[k:e + 1].sum() / total)))
+            k = e + 1
+        else:
+            k += 1
+    zones.sort(key=lambda z: -z[2])
+    return zones[:3]
+
+
 def detect_kline_signals(df):
-    """掃描整段日K，回傳 (含均線的資料表, 訊號清單)。訊號：{idx, date, kind(entry/exit), name, detail, close, stop}。"""
+    """掃描整段日K，回傳 (含均線的資料表, 訊號清單)。
+    訊號：{idx, date, kind(entry/exit), name, detail, close, entry(建議進場價區間或 None), stop(停損／出場價或 None)}。"""
     d = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
     if len(d) < 30:
         return d, []
@@ -2759,10 +2803,26 @@ def detect_kline_signals(df):
     rng, upper, lower = H - L, H - top, bot - L
     avg_body = pd.Series(body).rolling(20).mean().to_numpy()
     vol5 = pd.Series(V).shift(1).rolling(5).mean().to_numpy()
+    vol20 = pd.Series(V).shift(1).rolling(20).mean().to_numpy()  # 月均量（不含當天）
 
-    sigs = []
+    # 頸線／大量區突破：收盤突破前 60 日高點、量 ≥ 月均量 N 倍、且前 60 日屬區間整理
+    hi60 = pd.Series(H).shift(1).rolling(NECK_LOOKBACK).max().to_numpy()
+    lo60 = pd.Series(L).shift(1).rolling(NECK_LOOKBACK).min().to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        neck_range = (hi60 - lo60) / lo60
+        neck_brk = (C > hi60) & (V >= NECK_VOL_MULT * vol20) & (neck_range <= NECK_MAX_RANGE)
 
-    def add(i, kind, name, extra="", stop=None):
+    # 價量背離日：收盤創 20 日新高，但量低於月均量 0.9 倍，或能量潮 OBV 沒有同步創高
+    obv = np.cumsum(np.sign(np.diff(C, prepend=C[0])) * V)
+    div = np.zeros(len(d), dtype=bool)
+    for k in range(21, len(d)):
+        if C[k] >= C[k - 20:k].max() and np.isfinite(vol20[k]):
+            div[k] = bool(V[k] < 0.9 * vol20[k] or obv[k] < obv[k - 20:k].max())
+
+    sigs, last_sig = [], {}
+
+    def add(i, kind, name, extra="", stop=None, entry=None, stop_label=None):
+        last_sig[name] = i
         sigs.append(
             {
                 "idx": i,
@@ -2771,9 +2831,15 @@ def detect_kline_signals(df):
                 "name": name,
                 "detail": KLINE_TIPS[name] + (f"（{extra}）" if extra else ""),
                 "close": float(C[i]),
+                "entry": None if entry is None else (float(min(entry)), float(max(entry))),
                 "stop": None if stop is None else float(stop),
+                # 價位的意思：進場訊號＝停損；出場訊號＝跌破此價出場；「跌破支撐／均線」＝反彈站不回此價就出場
+                "stop_label": stop_label or ("停損" if kind == "entry" else "跌破出場"),
             }
         )
+
+    def cooled(name, i, gap):
+        return i - last_sig.get(name, -999) >= gap
 
     for i in range(25, len(d)):
         if rng[i] <= 0 or not np.isfinite(MA20[i]) or not np.isfinite(avg_body[i]):
@@ -2787,54 +2853,144 @@ def detect_kline_signals(df):
         vr = V[i] / vol5[i] if np.isfinite(vol5[i]) and vol5[i] > 0 else np.nan
         long_lower = lower[i] >= 2 * body[i] and lower[i] >= 0.6 * rng[i] and upper[i] <= 0.2 * rng[i]
         long_upper = upper[i] >= 2 * body[i] and upper[i] >= 0.6 * rng[i] and lower[i] <= 0.2 * rng[i]
+        nodes = _volume_nodes(H, L, C, V, i)  # 分價量大量區（只用 i 以前的資料）
 
         # ---------------- 進場 ----------------
         if long_lower and down and near_low:
-            add(i, "entry", "錘形線", "長下影線出現在下跌段低檔", stop=L[i])
+            add(i, "entry", "錘形線", "長下影線出現在下跌段低檔", entry=(C[i], H[i]), stop=L[i])
         if (
             C[i - 1] < O[i - 1] and C[i] > O[i] and O[i] <= C[i - 1] and C[i] >= O[i - 1]
             and body[i] > body[i - 1] and down_soft
         ):
-            add(i, "entry", "多頭吞噬", "紅K吞沒前一根黑K", stop=min(L[i], L[i - 1]))
+            extra = "紅K吞沒前一根黑K"
+            if np.isfinite(vol20[i]) and V[i - 5:i].mean() <= 0.7 * vol20[i] and V[i] >= 1.3 * V[i - 1]:
+                extra += (
+                    f"；前 5 日量縮至月均量 {V[i - 5:i].mean() / vol20[i] * 100:.0f}%、今日帶量轉折，"
+                    "屬量縮打底後的低量轉折紅K，可視為試單進場時機"
+                )
+            add(i, "entry", "多頭吞噬", extra, entry=((O[i] + C[i]) / 2, C[i]), stop=min(L[i], L[i - 1]))
         if (
             C[i - 2] < O[i - 2] and body[i - 2] >= avg_body[i] and C[i - 2] < MA10[i - 2]
             and body[i - 1] <= 0.5 * avg_body[i] and top[i - 1] <= C[i - 2]
             and C[i] > O[i] and body[i] >= avg_body[i] and C[i] > (O[i - 2] + C[i - 2]) / 2
         ):
-            add(i, "entry", "早晨之星", "第三根長紅已確認", stop=min(L[i - 2:i + 1]))
+            add(i, "entry", "早晨之星", "第三根長紅已確認", entry=((O[i] + C[i]) / 2, C[i]), stop=min(L[i - 2:i + 1]))
         uptrend = MA5[i] > MA10[i] > MA20[i] and MA20[i] > MA20[i - 3]
         near10 = L[i] <= MA10[i] * 1.015 and C[i] >= MA10[i] * 0.99
         near20 = L[i] <= MA20[i] * 1.015 and C[i] >= MA20[i]
         if uptrend and (near10 or near20) and C[i] < C[i - 5:i].max():
-            add(i, "entry", "拉回買進", "回測 10 日線未破" if near10 else "回測 20 日線未破", stop=MA20[i] * 0.99)
-        if C[i] > O[i] and C[i] > H[i - 20:i].max() and np.isfinite(vr) and vr >= 1.5:
-            add(i, "entry", "突破買進", f"突破近 20 日高點，成交量為 5 日均量 {vr:.1f} 倍", stop=H[i - 20:i].max())
+            ma_ = MA10[i] if near10 else MA20[i]
+            add(i, "entry", "拉回買進", "回測 10 日線未破" if near10 else "回測 20 日線未破",
+                entry=(ma_, ma_ * 1.01), stop=MA20[i] * 0.99)
+        brk_buy = (
+            C[i] > O[i] and C[i] > H[i - 20:i].max() and np.isfinite(vr) and vr >= 1.5
+        )
+        if brk_buy:
+            lvl, stop_ = H[i - 20:i].max(), H[i - 20:i].max()
+            extra = f"突破近 20 日高點，成交量為 5 日均量 {vr:.1f} 倍"
+            if neck_brk[i]:
+                lvl, stop_ = hi60[i], hi60[i] * NECK_STOP_PCT
+                extra += (
+                    f"；同時帶量突破近 {NECK_LOOKBACK} 日區間頸線 {hi60[i]:.2f}"
+                    f"（成交量為月均量 {V[i] / vol20[i]:.1f} 倍），為積極進場點，停損設頸線下 3%"
+                )
+            add(i, "entry", "突破買進", extra, entry=(lvl, lvl * 1.02), stop=stop_)
 
-        # ---------------- 出場 ----------------
+        # 新增：突破頸線／大量區後，隔天或數日內回測頸線不破（突破當天已由「突破買進」涵蓋，故不重複）
+        if not brk_buy:
+            for k in (1, 2, 3):
+                j = i - k
+                if neck_brk[j]:
+                    neck = hi60[j]
+                    if C[j + 1:i + 1].min() >= neck and L[i] <= neck * 1.02 and V[i] < V[j]:
+                        add(
+                            i, "entry", "回測頸線不破",
+                            f"{k} 個交易日前帶量（月均量 {V[j] / vol20[j]:.1f} 倍）突破頸線 {neck:.2f}，"
+                            f"今日回測收盤未破、量縮",
+                            entry=(neck, neck * 1.01), stop=neck * NECK_STOP_PCT,
+                        )
+                        break
+
+        # 新增：分價量統計表支撐區（回測下檔大量區且量縮止穩）
+        if nodes and np.isfinite(vr) and vr <= 0.8 and cooled("回測大量支撐區", i, 5):
+            for zlo, zhi, share in nodes:
+                if (
+                    L[i] <= zhi * 1.01 and C[i] >= zlo and L[i] >= zlo * ZONE_BREAK_PCT * 0.99
+                    and C[i - 5:i].max() > zhi * 1.02
+                ):
+                    add(
+                        i, "entry", "回測大量支撐區",
+                        f"近 {VOL_PROFILE_WINDOW} 日大量區 {zlo:.2f}～{zhi:.2f}（約佔成交量 {share * 100:.0f}%），"
+                        f"今日量為 5 日均量 {vr:.1f} 倍、收盤守在區間之上",
+                        entry=(zlo, zhi), stop=zlo * ZONE_BREAK_PCT,
+                    )
+                    break
+
+        # ---------------- 出場（停損／出場價＝跌破此價出場；「跌破支撐／均線」則為反彈站不回此價就出場） ----------------
         if up and near_high and (long_lower or long_upper):
-            add(i, "exit", "上吊線／射擊之星", "長下影（上吊線）" if long_lower else "長上影（射擊之星）")
+            add(i, "exit", "上吊線／射擊之星", "長下影（上吊線）" if long_lower else "長上影（射擊之星）", stop=L[i])
         if (
             C[i - 1] > O[i - 1] and C[i] < O[i] and O[i] >= C[i - 1] and C[i] <= O[i - 1]
             and body[i] > body[i - 1] and up_soft
         ):
-            add(i, "exit", "空頭吞噬", "黑K吞沒前一根紅K")
+            add(i, "exit", "空頭吞噬", "黑K吞沒前一根紅K", stop=L[i])
         if (
             C[i - 2] > O[i - 2] and body[i - 2] >= avg_body[i] and C[i - 2] > MA10[i - 2]
             and body[i - 1] <= 0.5 * avg_body[i] and bot[i - 1] >= C[i - 2]
             and C[i] < O[i] and body[i] >= avg_body[i] and C[i] < (O[i - 2] + C[i - 2]) / 2
         ):
-            add(i, "exit", "黃昏之星", "第三根長黑已確認")
+            add(i, "exit", "黃昏之星", "第三根長黑已確認", stop=min(L[i - 1], L[i]))
         if C[i] < O[i] and body[i] >= avg_body[i]:
-            broke = []
+            broke, levels = [], []
             if C[i] < MA10[i] and C[i - 1] >= MA10[i - 1]:
                 broke.append("跌破 10 日線")
+                levels.append(MA10[i])
             if C[i] < L[i - 10:i].min():
                 broke.append("跌破近 10 日低點")
+                levels.append(L[i - 10:i].min())
             if C[i] < MA5[i] and C[i - 1] >= MA5[i - 1] and np.isfinite(vr) and vr >= 1.5:
                 broke.append("爆量跌破 5 日線")
-            if broke:
-                add(i, "exit", "跌破支撐／均線", "、".join(broke))
+                levels.append(MA5[i])
+            # 新增：原先底部的大量支撐區被長黑有效跌破
+            for zlo, zhi, share in nodes:
+                if C[i - 1] >= zlo and C[i] < zlo * ZONE_BREAK_PCT:
+                    broke.append(f"長黑有效跌破下檔大量支撐區 {zlo:.2f}～{zhi:.2f}")
+                    levels.append(zlo)
+                    break
+            # 新增：高檔區出現長黑K＋巨量（恐慌出貨／主力倒貨）
+            hv_black = (
+                np.isfinite(vr) and vr >= 2 and C[i - 1] > MA20[i - 1]
+                and C[i - 1] >= C[max(0, i - 60):i].max() * 0.92
+            )
+            hv_txt = f"高檔爆量長黑（成交量為 5 日均量 {vr:.1f} 倍，疑似恐慌出貨／主力倒貨）" if hv_black else ""
+            if broke:  # 與原本「跌破」訊號重複者合併成同一筆
+                add(i, "exit", "跌破支撐／均線", "、".join(([hv_txt] if hv_black else []) + broke), stop=max(levels), stop_label="反彈出場")
+            elif hv_black:
+                add(i, "exit", "高檔爆量長黑", hv_txt, stop=L[i])
+
+        # 新增：高檔價漲量縮／價量背離連續出現三次以上
+        if div[i] and cooled("高檔量價背離", i, 8):
+            cnt, last_j = 0, None
+            for j in range(i, max(20, i - 40), -1):
+                if div[j] and (last_j is None or last_j - j >= 3):
+                    cnt += 1
+                    last_j = j
+            if cnt >= 3:
+                add(
+                    i, "exit", "高檔量價背離",
+                    f"近 40 個交易日已出現 {cnt} 次「創高但量縮／能量潮未同步創高」",
+                    stop=MA10[i] if MA10[i] < C[i] else L[i],
+                )
     return d, sigs
+
+
+def _pz(v):
+    """建議價格：粗體、放大，方便一眼看到（需搭配 unsafe_allow_html=True）。"""
+    return f"<span style='font-size:1.35em;font-weight:800'>{v:.2f}</span>"
+
+
+def _pz_range(lo, hi):
+    return _pz(lo) if abs(hi - lo) <= 0.005 else f"{_pz(lo)}～{_pz(hi)}"
 
 
 def _describe_last_bar(d):
@@ -2899,6 +3055,10 @@ def _pv_score(A, i):
         out.append((-6, f"價漲量縮（僅 5 日均量 {vr:.1f} 倍）且逼近高點，追價意願不足，留意背離"))
     elif c < pc and vr <= 0.7 and c > A["MA20"][i]:
         out.append((3, f"價跌量縮（僅 5 日均量 {vr:.1f} 倍）且仍在 20 日線上，賣壓輕、屬健康回檔"))
+    elif c < pc and vr <= 0.7 and near_low:
+        out.append((4, f"價跌量縮（僅 5 日均量 {vr:.1f} 倍）且貼近 20 日低點，賣壓竭盡、籌碼趨穩，進入築底觀察期（搭配 W 底，等量增長紅K確認再進場）"))
+    elif c > pc and vr <= 0.7:
+        out.append((-3, f"價漲量縮（僅 5 日均量 {vr:.1f} 倍），虛漲／動能衰退，追價意願不足，不宜貿然追高"))
 
     # 價量背離：價創 20 日新高／新低，但 OBV 沒跟上
     obv, obv_win = A["OBV"][i], A["OBV"][i - 20:i]
@@ -3075,12 +3235,19 @@ def _render_prediction(d, sigs, inst_table=None):
     close = float(A["Close"][i])
     sup = [v for v in (A["MA5"][i], A["MA10"][i], A["MA20"][i], A["Low"][i - 10:i].min()) if v < close]
     res = [v for v in (A["MA5"][i], A["MA10"][i], A["MA20"][i], A["High"][i - 20:i].max()) if v > close]
-    support = max(sup) if sup else float(A["Low"][i - 10:i].min())
-    resist = min(res) if res else float(A["High"][i - 20:i].max())
+    # 已跌破所有均線與近期低點（或已突破所有壓力）時，下方沒有支撐（上方沒有壓力），改用今日最低（最高）價當參考
+    support = max(sup) if sup else float(A["Low"][i])
+    resist = min(res) if res else float(A["High"][i])
     m1, m2, m3 = st.columns(3)
     m1.metric("預測分數（-100～+100）", f"{score:+d}")
-    m2.metric("下方支撐（跌破轉弱）", f"{support:.2f}")
-    m3.metric("上方壓力（突破轉強）", f"{resist:.2f}")
+    m2.metric(
+        "下方支撐（跌破轉弱）", f"{support:.2f}",
+        help=None if sup else "收盤已跌破所有均線與近 10 日低點，下方暫無支撐，改以今日最低價當參考。",
+    )
+    m3.metric(
+        "上方壓力（突破轉強）", f"{resist:.2f}",
+        help=None if res else "收盤已站上所有均線與近 20 日高點，上方暫無壓力，改以今日最高價當參考。",
+    )
     st.progress((score + 100) / 200)
     st.caption(f"分數 ≥ +{PRED_THRESHOLD} 偏多、≤ -{PRED_THRESHOLD} 偏空，其餘觀望。")
 
@@ -3097,11 +3264,6 @@ def _render_prediction(d, sigs, inst_table=None):
     else:
         st.caption("ℹ️ 未取得三大法人資料（非台股或來源暫時無法連線），本次預測只含技術面與量價。")
 
-    # 理由（依影響力大小排序）
-    st.markdown("**判斷理由**")
-    for pts, txt in sorted(reasons, key=lambda x: -abs(x[0])):
-        st.markdown(f"- {'🔴 ➕' if pts > 0 else '🟢 ➖'} `{pts:+d}`　{txt}")
-
     # 隔日進出場參考（用近 14 日平均真實波幅 ATR 估算當日合理波動）
     H_, L_, C_ = A["High"], A["Low"], A["Close"]
     tr = np.maximum(H_[1:] - L_[1:], np.maximum(np.abs(H_[1:] - C_[:-1]), np.abs(L_[1:] - C_[:-1])))
@@ -3109,22 +3271,43 @@ def _render_prediction(d, sigs, inst_table=None):
     st.markdown("**📌 隔日進出場參考**")
     if verdict == "bull":
         st.markdown(
-            f"- 📈 **進場**：開盤後回測 **{close - 0.5 * atr:.2f}～{close:.2f}** 分批買進；若開盤直接跳空超過 **{close + atr:.2f}** 不追價。\n"
-            f"- 🛡️ **停損**：跌破 **{support:.2f}** 出場。\n"
-            f"- 🎯 **第一目標／壓力**：**{resist:.2f}** 附近，量縮不過可先減碼。"
+            f"- 📈 **進場**：開盤後回測 {_pz_range(close - 0.5 * atr, close)} 分批買進；若開盤直接跳空超過 {_pz(close + atr)} 不追價。\n"
+            f"- 🛡️ **停損**：跌破 {_pz(support)} 出場。\n"
+            f"- 🎯 **第一目標／壓力**：{_pz(resist)} 附近，量縮不過可先減碼。",
+            unsafe_allow_html=True,
         )
     elif verdict == "bear":
         st.markdown(
-            f"- 📉 **出場／減碼**：開盤逢反彈 **{close:.2f}～{close + 0.5 * atr:.2f}** 先賣；若開盤直接跌破 **{close - atr:.2f}** 不宜再凹單。\n"
-            f"- 🛡️ **全數出場**：跌破 **{support:.2f}**。\n"
-            f"- 🔄 **空手者**：站回 **{resist:.2f}** 且量能放大，才重新考慮進場。"
+            f"- 📉 **出場／減碼**：開盤逢反彈 {_pz_range(close, close + 0.5 * atr)} 先賣；若開盤直接跌破 {_pz(close - atr)} 不宜再凹單。\n"
+            f"- 🛡️ **全數出場**：跌破 {_pz(support)}。\n"
+            f"- 🔄 **空手者**：站回 {_pz(resist)} 且量能放大，才重新考慮進場。",
+            unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            f"- 👀 **進場條件**：收盤站上 **{resist:.2f}** 且成交量放大（≥ 5 日均量 1.5 倍）再進場。\n"
-            f"- 🚪 **出場條件**：收盤跌破 **{support:.2f}** 就減碼／出場。\n"
-            f"- ⏳ 區間內（{support:.2f}～{resist:.2f}）不動作，等方向。"
+            f"- 👀 **進場條件**：收盤站上 {_pz(resist)} 且成交量放大（≥ 5 日均量 1.5 倍）再進場。\n"
+            f"- 🚪 **出場條件**：收盤跌破 {_pz(support)} 就減碼／出場。\n"
+            f"- ⏳ 區間內（{support:.2f}～{resist:.2f}）不動作，等方向。",
+            unsafe_allow_html=True,
         )
+
+    # 分價量統計：近半年成交量最集中的價位區（下方的大量區＝支撐）
+    nodes_now = _volume_nodes(A["High"], A["Low"], A["Close"], d["Volume"].to_numpy(float), n)
+    below = [z for z in nodes_now if z[0] < close]
+    if below:
+        zlo, zhi, share = max(below, key=lambda z: z[1])
+        where = "股價目前就在此區內" if zlo <= close <= zhi else f"在股價下方 {(close / zhi - 1) * 100:.1f}%"
+        st.markdown(
+            f"- 📊 **下檔大量支撐區 {zlo:.2f}～{zhi:.2f}**（約佔近 {VOL_PROFILE_WINDOW} 日成交量 {share * 100:.0f}%，{where}）："
+            f"回測此區且量縮止穩，可在 {_pz_range(zlo, zhi)} 低風險切入；"
+            f"收盤跌破 {_pz(zlo * ZONE_BREAK_PCT)}（被長黑有效跌破）代表支撐失效，必須停損。",
+            unsafe_allow_html=True,
+        )
+
+    # 理由（依影響力大小排序）
+    st.markdown("**判斷理由**")
+    for pts, txt in sorted(reasons, key=lambda x: -abs(x[0])):
+        st.markdown(f"- {'🔴 ➕' if pts > 0 else '🟢 ➖'} `{pts:+d}`　{txt}")
 
     # 回測：這檔股票過去同樣判斷，隔天實際表現
     stats = {"bull": [], "bear": []}
@@ -3168,7 +3351,7 @@ def _kline_start():
 
 
 def render_kline_analysis():
-    st.markdown("##### 📐 K線分析：判斷進出場時機")
+    st.markdown("##### 📐 K線分析：用型態判斷進出場時機")
     mobile_ = is_mobile()
     c1, c2 = (st.container(), st.container()) if mobile_ else st.columns([3, 1], vertical_alignment="bottom")
     with c1:
@@ -3184,7 +3367,7 @@ def render_kline_analysis():
 
     req = st.session_state.get("kline_req")
     if req is None:
-        st.info("請輸入股票代號或名稱後按「開始分析」。")
+        st.info("請輸入股票代號或名稱後按「開始分析」；留白則分析「個股分析」目前查詢的股票。")
         return
     kw, default_symbol = req
     target = kw or default_symbol
@@ -3241,6 +3424,24 @@ def render_kline_analysis():
     def _names(lst):
         return "、".join(f"{s['name']}（{s['date'].strftime('%m/%d')}）" for s in lst)
 
+    def _price_txt(s, html=False):
+        """建議進場價與停損／出場價的文字（沒有就回傳空字串）。html=True 時數字用粗體大字。"""
+        num = _pz if html else (lambda v: f"{v:.2f}")
+        rng_ = _pz_range if html else (lambda lo, hi: f"{lo:.2f}" + (f"～{hi:.2f}" if abs(hi - lo) > 0.005 else ""))
+        parts = []
+        if s.get("entry"):
+            parts.append("建議進場 " + rng_(*s["entry"]))
+        if s.get("stop"):
+            parts.append(f"{s.get('stop_label') or '停損'} " + num(s["stop"]))
+        return "　".join(parts)
+
+    def _price_lines(lst):
+        lines = [
+            f"- 💰 **{s['name']}**（{s['date'].strftime('%m/%d')}）　{_price_txt(s, html=True)}"
+            for s in lst if _price_txt(s)
+        ]
+        return "\n".join(lines)
+
     if buys and sells:
         st.warning(
             f"⚖️ 最近 3 個交易日多空訊號並存：進場 {_names(buys)}；出場 {_names(sells)}。"
@@ -3252,10 +3453,8 @@ def render_kline_analysis():
             "持股者可考慮減碼或獲利了結，並嚴守停損紀律。"
         )
     elif buys:
-        stops = [s["stop"] for s in buys if s["stop"]]
-        stop_txt = f"停損參考 {min(stops):.2f}（跌破即出場）。" if stops else ""
         st.success(
-            f"🔔 最近 3 個交易日出現進場訊號：{_names(buys)}。建議等確認後分批進場。{stop_txt}"
+            f"🔔 最近 3 個交易日出現進場訊號：{_names(buys)}。建議等確認後分批進場。"
         )
     else:
         tips = {
@@ -3264,6 +3463,9 @@ def render_kline_analysis():
             "盤整／趨勢未明": "目前沒有明確的K線訊號，趨勢未明：先觀望，等突破或跌破區間再行動。",
         }
         st.info("💡 " + tips[trend])
+    _pl = _price_lines(buys + sells)
+    if _pl:
+        st.markdown(_pl, unsafe_allow_html=True)
 
     inst_table = None
     if valid.endswith((".TW", ".TWO")):
@@ -3308,7 +3510,13 @@ def render_kline_analysis():
                     marker=dict(symbol=symbol_, size=12, color=color),
                     text=["/".join(s["name"] for s in v) for v in pts.values()],
                     textposition=pos, textfont=dict(size=10, color=color),
-                    hovertext=["<br>".join(f"{s['name']}：{s['detail']}" for s in v) for v in pts.values()],
+                    hovertext=[
+                        "<br>".join(
+                            f"{s['name']}：{s['detail']}" + (f"<br>💰 {_price_txt(s)}" if _price_txt(s) else "")
+                            for s in v
+                        )
+                        for v in pts.values()
+                    ],
                     hoverinfo="x+text",
                 )
             )
@@ -3329,21 +3537,29 @@ def render_kline_analysis():
             ".kl-wrap th{text-align:left;padding:8px 10px;background:rgba(128,128,128,.18);white-space:nowrap}"
             ".kl-wrap td{padding:8px 10px;border-top:1px solid rgba(128,128,128,.25);vertical-align:top}"
             ".kl-wrap td.n{text-align:right;white-space:nowrap}"
+            ".kl-wrap td.p{text-align:right;white-space:nowrap;font-weight:800;font-size:1.15rem}"
             ".kl-wrap td.t{min-width:280px;line-height:1.5}</style>"
         )
         rows_html = []
         for s_ in reversed(shown_sigs):
             entry = s_["kind"] == "entry"
             color = "#ff9f1c" if entry else "#2ec4b6"
-            stop = "—" if s_["stop"] is None else f"{s_['stop']:.2f}"
+            stop = "—" if s_["stop"] is None else (
+                f"{s_['stop']:.2f}<div style='font-size:.7rem;font-weight:400;opacity:.7'>{s_['stop_label']}</div>"
+            )
+            if s_.get("entry"):
+                e_lo, e_hi = s_["entry"]
+                entry_txt = f"{e_lo:.2f}" if abs(e_hi - e_lo) <= 0.005 else f"{e_lo:.2f}～{e_hi:.2f}"
+            else:
+                entry_txt = "—"
             rows_html.append(
                 f"<tr><td style='white-space:nowrap'>{s_['date'].strftime('%Y-%m-%d')}</td>"
                 f"<td style='white-space:nowrap;color:{color}'>{'📈 進場' if entry else '📉 出場'}</td>"
                 f"<td style='white-space:nowrap'>{html_escape(s_['name'])}</td>"
-                f"<td class='n'>{s_['close']:.2f}</td><td class='n'>{stop}</td>"
+                f"<td class='n'>{s_['close']:.2f}</td><td class='p'>{entry_txt}</td><td class='p'>{stop}</td>"
                 f"<td class='t'>{html_escape(s_['detail'])}</td></tr>"
             )
-        head = "".join(f"<th>{h}</th>" for h in ("日期", "訊號", "型態", "收盤價", "停損參考", "操作解讀"))
+        head = "".join(f"<th>{h}</th>" for h in ("日期", "訊號", "型態", "收盤價", "建議進場價", "停損／出場價", "操作解讀"))
         st.markdown(
             css + f"<div class='kl-wrap'><table><thead><tr>{head}</tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>",
             unsafe_allow_html=True,
@@ -3359,10 +3575,12 @@ def render_kline_analysis():
 | 型態 | 判斷條件（本頁的程式規則） | 操作 |
 |---|---|---|
 | 錘形線 | 下影線 ≥ 實體 2 倍且佔全日振幅 6 成以上、上影線很短；出現在下跌後的近期低點 | 下跌段尾端，止跌回升機會高 |
-| 多頭吞噬 | 前一天黑K、當天紅K實體更大並完全包覆；前一天收在 10 日線下 | 底部翻轉訊號 |
+| 多頭吞噬 | 前一天黑K、當天紅K實體更大並完全包覆；前一天收在 10 日線下。若前 5 日均量 ≤ 月均量 7 成、今日量 ≥ 前一日 1.3 倍，標註為「量縮打底後的低量轉折紅K」 | 底部翻轉訊號；量縮轉折時可試單 |
 | 早晨之星 | 長黑 → 小K（實體不高於第一根收盤）→ 長紅，且收在第一根實體中點之上 | 第三根長紅確認時或隔日逢低切入 |
 | 拉回買進 | 5 > 10 > 20 日線多頭排列、20 日線上揚；回檔觸及 10 或 20 日線附近但收盤未破線 | 上升趨勢中回檔進場 |
-| 突破買進 | 紅K收盤突破近 20 日最高價，且成交量 ≥ 5 日均量 1.5 倍 | 突破有效、量增時順勢買進 |
+| 突破買進 | 紅K收盤突破近 20 日最高價，且成交量 ≥ 5 日均量 1.5 倍；若同時收盤突破前 60 日高點（頸線）、量 ≥ 月均量 1.5 倍、前 60 日振幅 ≤ 45%，會標註為突破頸線 | 突破有效、量增時順勢買進 |
+| 回測頸線不破 | 近 3 日內曾帶量突破頸線（條件同上）；今日回測頸線（最低價在頸線上 2% 內）、收盤未跌破頸線、量縮 | 突破後回測不破的積極進場點 |
+| 回測大量支撐區 | 分價量統計（近 120 日，依成交量分 24 格價位）找出成交量最集中的價位區；股價自上方回測到該區、收盤守住區間下緣、量 ≤ 5 日均量 0.8 倍 | 量縮止穩的低風險切入點 |
 
 **出場時機**
 
@@ -3371,9 +3589,26 @@ def render_kline_analysis():
 | 上吊線／射擊之星 | 長下影（上吊線）或長上影（射擊之星），出現在上漲後的近期高點 | 賣壓沉重，準備減碼 |
 | 空頭吞噬 | 前一天紅K、當天黑K實體更大並完全吞沒；前一天收在 10 日線上 | 短線由多轉空 |
 | 黃昏之星 | 長紅 → 小K（實體不低於第一根收盤）→ 長黑，且收在第一根實體中點之下 | 獲利了結或退場 |
-| 跌破支撐／均線 | 長黑K跌破 10 日線、近 10 日低點，或爆量跌破 5 日線 | 紀律停損或出場 |
+| 跌破支撐／均線 | 長黑K跌破 10 日線、近 10 日低點、爆量跌破 5 日線，或收盤有效跌破下檔大量支撐區（低於區間下緣 1%） | 紀律停損或出場 |
+| 高檔爆量長黑 | 長黑K、量 ≥ 5 日均量 2 倍，前一日收在 20 日線上且距近 60 日高點 8% 內（若同時跌破均線或支撐，併入上一列） | 恐慌出貨／主力倒貨，果斷停利停損 |
+| 高檔量價背離 | 近 40 日內至少 3 次「收盤創 20 日新高，但量 < 月均量 0.9 倍或 OBV 未同步創高」（兩次間隔 ≥ 3 根K） | 上攻動能耗盡，分批獲利了結／降低持股 |
 
 「長紅／長黑」＝實體大於近 20 日平均實體。
+
+**建議進場價／停損價怎麼算**
+
+| 型態 | 建議進場價 | 停損／出場價 |
+|---|---|---|
+| 錘形線 | 收盤價～錘形線最高價（站上高點再進較穩） | 錘形線最低價 |
+| 多頭吞噬／早晨之星 | 紅K實體中點～收盤價（隔日逢低） | 型態最低價 |
+| 拉回買進 | 被回測的均線～均線 +1% | 20 日線下 1% |
+| 突破買進 | 突破價～突破價 +2%（過高不追，等回測） | 突破價；突破頸線者為頸線下 3% |
+| 回測頸線不破 | 頸線～頸線 +1% | 頸線下 3% |
+| 回測大量支撐區 | 大量區上下緣之間 | 大量區下緣再下 1% |
+| 上吊線／射擊之星、空頭吞噬 | — | 訊號K最低價（跌破即出場） |
+| 黃昏之星、高檔爆量長黑 | — | 長黑K最低價（跌破即出場） |
+| 跌破支撐／均線 | — | 被跌破的價位（反彈站不回就出場） |
+| 高檔量價背離 | — | 10 日線（跌破即分批出場） |
 
 **下個交易日預測的評分因子（-100～+100）**
 
@@ -3381,7 +3616,7 @@ def render_kline_analysis():
 |---|---|---|
 | K線型態 | 近 3 日進出場訊號，越新權重越高 | ±30 |
 | 均線／MACD／RSI／乖離 | 趨勢排列、動能、過熱或超跌 | 約 ±40 |
-| 量價關係 | 價漲量增、價跌量增、價漲量縮背離、OBV 背離、高低檔爆量長影線 | ±20 |
+| 量價關係 | 價漲量增、價跌量增、價漲量縮（高檔背離／虛漲）、價跌量縮（健康回檔／低檔築底）、OBV 背離、高低檔爆量長影線 | ±20 |
 | 三大法人 | 外資／投信連買連賣、買賣超佔成交量比、近 5 日方向、土洋同向 | ±20 |
             """
         )
