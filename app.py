@@ -1937,8 +1937,35 @@ if "search_stopped" not in st.session_state:
     st.session_state.search_stopped = False
 
 
+# 各頁籤的搜尋輸入框；任一頁籤搜尋時，其餘輸入框也同步成同一個關鍵字
+SEARCH_INPUT_KEYS = ("input_val", "kline_input", "kline2_input")
+
+
+def request_search(keyword):
+    """任一頁籤按下搜尋：同步所有輸入框，並記下關鍵字；真正的查詢在主流程進行，
+    查完後「目前股票」更新，所有頁籤（個股分析、K線分析、K線分析2）就會一起顯示同一檔股票。"""
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return
+    for k in SEARCH_INPUT_KEYS:
+        st.session_state[k] = keyword
+    st.session_state.pending_search = keyword
+    st.session_state.search_stopped = False
+
+
+def current_stock():
+    """全站共用的目前股票：回傳 (代號, 顯示名稱, 查詢失敗的關鍵字)。尚未搜尋時代號為 None。"""
+    trig = st.session_state.get("trigger_search", "")
+    if not trig:
+        return None, "", None
+    if trig.startswith("FAILED:"):
+        return None, "", trig[len("FAILED:"):]
+    return trig, st.session_state.get("current_name", ""), None
+
+
 def click_history_btn(stock_symbol, stock_name):
-    st.session_state.input_val = stock_name
+    for k in SEARCH_INPUT_KEYS:
+        st.session_state[k] = stock_name
     st.session_state.search_stopped = False
     st.session_state.pending_search = ""
     st.session_state.trigger_search = stock_symbol
@@ -1952,10 +1979,7 @@ def delete_single_history(index):
 
 def handle_search_button_click():
     """按下搜尋只記下關鍵字；真正的查詢在主流程進行，這樣才能顯示載入中與停止按鈕。"""
-    keyword = st.session_state.input_val.strip()
-    if keyword:
-        st.session_state.pending_search = keyword
-        st.session_state.search_stopped = False
+    request_search(st.session_state.input_val)
 
 
 def stop_search():
@@ -3423,12 +3447,8 @@ def _render_prediction(d, sigs, inst_table=None):
 
 
 def _kline_start():
-    """按下「開始分析」（或在輸入框按 Enter）：記下要分析的對象，之後每次重繪都用這份紀錄。"""
-    kw = st.session_state.get("kline_input", "").strip()
-    default_symbol = st.session_state.get("trigger_search", "")
-    if default_symbol.startswith("FAILED:"):
-        default_symbol = ""
-    st.session_state.kline_req = (kw, default_symbol)
+    """按下「開始分析」（或在輸入框按 Enter）：等同於在「個股分析」搜尋，所有頁籤會一起切換到這檔股票。"""
+    request_search(st.session_state.get("kline_input", ""))
 
 
 def _kline_price_body(symbol, last_close, prev_bar_close):
@@ -3459,7 +3479,7 @@ def render_kline_analysis():
     c1, c2 = (st.container(), st.container()) if mobile_ else st.columns([3, 1], vertical_alignment="bottom")
     with c1:
         st.text_input(
-            "股票代號或中文名稱（留白＝使用「個股分析」目前查詢的股票）",
+            "股票代號或中文名稱（搜尋後所有頁籤同步顯示這檔股票）",
             key="kline_input",
             on_change=_kline_start,  # 按 Enter 也會開始分析
         )
@@ -3468,18 +3488,15 @@ def render_kline_analysis():
                   width="stretch" if mobile_ else "content")
     range_label = st.radio("圖表區間", list(KLINE_RANGES), index=1, horizontal=True, key="kline_range")
 
-    req = st.session_state.get("kline_req")
-    if req is None:
-        st.info("請輸入股票代號或名稱後按「開始分析」；留白則分析「個股分析」目前查詢的股票。")
+    symbol, cur_name, failed = current_stock()
+    if failed is not None:
+        st.error(f"❌ 找不到「{failed}」的相關股票資料。請檢查輸入是否正確。")
         return
-    kw, default_symbol = req
-    target = kw or default_symbol
-    if not target:
-        st.info("請輸入股票代號或名稱，或先在「個股分析」查詢一檔股票。")
+    if not symbol:
+        st.info("請輸入股票代號或名稱後按「開始分析」；搜尋結果會與「個股分析」、「K線分析2」同步。")
         return
 
     with st.spinner("⏳ 載入資料中，請稍候…"):
-        symbol = get_ticker_from_name(target) if kw else default_symbol
         hist, valid = pd.DataFrame(), None
         for cand in [symbol] + ([symbol[:-3] + ".TWO"] if symbol.endswith(".TW") else []):
             try:
@@ -3490,9 +3507,9 @@ def render_kline_analysis():
                 valid = cand
                 break
         if valid is None:
-            st.error(f"❌ 找不到「{target}」的股價資料。")
+            st.error(f"❌ 找不到「{symbol}」的股價資料。")
             return
-        name = resolve_display_name(valid, kw)
+        name = cur_name or resolve_display_name(valid, "")
         d, sigs = detect_kline_signals(hist)
 
     if len(d) < 30:
@@ -3715,15 +3732,741 @@ def render_kline_analysis():
 
 
 # ---------------------------------------------------------------------------
+# 頁籤：K線分析2
+# 參考「處置王－K線技術分析教學」的分析邏輯：
+#   18 種型態（單根 6、兩根 6、三根 6）＋前置趨勢（3／5／10 根）＋日週月季各自重新比對
+#   ＋重疊型態合併標註（+N）＋條件比對（每項條件的實際值與門檻）
+# 注意：該網站只公開型態的結構說明，沒有公開精確門檻；下面的門檻是本程式採用的常見慣例，
+#       所以結果可能和該 APP 不完全相同，一切以頁面內的「條件比對」為準。
+# 台股慣例：紅K＝收盤高於開盤（上漲），綠K＝收盤低於開盤（下跌）；紅箭頭＝偏多分類，綠箭頭＝偏空分類
+# ---------------------------------------------------------------------------
+# (名稱, 幾根K, 方向分類, 前置趨勢需求)  需求：down 前置下跌／up 前置上漲／notup 非上漲／notdown 非下跌／None 不限
+K2_PATTERNS = [
+    ("長紅線", 1, "bull", None), ("長黑線", 1, "bear", None),
+    ("錘子線", 1, "bull", "down"), ("吊人線", 1, "bear", "up"),
+    ("倒錘子線", 1, "bull", "down"), ("射擊之星", 1, "bear", "up"),
+    ("多頭吞噬", 2, "bull", "down"), ("空頭吞噬", 2, "bear", "up"),
+    ("貫穿線", 2, "bull", "down"), ("烏雲罩頂", 2, "bear", "up"),
+    ("多頭母子線", 2, "bull", "down"), ("空頭母子線", 2, "bear", "up"),
+    ("晨星", 3, "bull", "down"), ("黃昏之星", 3, "bear", "up"),
+    ("紅三兵", 3, "bull", "notup"), ("三隻烏鴉", 3, "bear", "notdown"),
+    ("三內升", 3, "bull", "down"), ("三內降", 3, "bear", "up"),
+]
+K2_DEFAULT_OFF = {"長紅線", "長黑線"}  # 與該網站一致：長紅線／長黑線預設不顯示，可手動開啟
+K2_DIR_TXT = {"bull": "偏多", "bear": "偏空"}
+K2_BARS = {"日": [60, 120, 250], "週": [52, 104, 260], "月": [36, 60, 120], "季": [20, 40]}
+K2_UNIT = {"日": "日", "週": "週", "月": "個月", "季": "季"}
+# 前置趨勢門檻：前 N 根的收盤漲跌幅達此比例才算上漲／下跌（依週期放大，並隨 N 調整）
+K2_TREND_BASE = {"日": 0.015, "週": 0.03, "月": 0.06, "季": 0.10}
+K2_LONG_BODY = 1.5         # 長實體：實體 ≥ 前 20 根平均實體的 1.5 倍
+K2_MID_BODY = 1.0          # 兩根／三根型態中「較明顯」的實體：≥ 平均實體 1.0 倍
+K2_SHORT_SHADOW = 0.3      # 長紅／長黑：上下影線各 ≤ 實體的 30%
+K2_SMALL_BODY_RNG = 0.35   # 錘子等小實體：實體 ≤ 全距的 35%
+K2_LONG_SHADOW_RNG = 0.6   # 長影線：≥ 全距的 60%（且 ≥ 實體 2 倍）
+K2_SHORT_SHADOW_RNG = 0.15  # 另一側短影線：≤ 全距的 15%
+K2_STAR_BODY = 0.5         # 星線：實體 ≤ 第一根實體的 50%
+K2_SOLDIER_BODY = 0.6      # 紅三兵／三隻烏鴉：每根實體 ≥ 平均實體的 60%
+
+
+class _K2Chk:
+    """記錄每一項「通過」的判斷條件（項目、本次實際值、門檻），給條件比對表使用。"""
+
+    def __init__(self):
+        self.rows = []
+
+    def ok(self, label, actual, thresh, cond):
+        if not bool(cond):
+            return False
+        self.rows.append((label, actual, thresh, "✅ 通過"))
+        return True
+
+
+class _K2Ctx:
+    def __init__(self, df, n_trend, period):
+        self.O, self.H, self.L, self.C = (df[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
+        self.body = np.abs(self.C - self.O)
+        self.rng = self.H - self.L
+        self.top, self.bot = np.maximum(self.O, self.C), np.minimum(self.O, self.C)
+        self.upper, self.lower = self.H - self.top, self.bot - self.L
+        self.avgb = pd.Series(self.body).shift(1).rolling(20, min_periods=5).mean().to_numpy()  # 前 20 根平均實體
+        self.n = n_trend
+        self.thr = K2_TREND_BASE[period] * float(np.sqrt(n_trend / 5))
+
+    def trend(self, s):
+        """型態第一根（索引 s）之前 N 根的趨勢：回傳 (up/down/flat, 漲跌幅)；資料不足回傳 (None, None)。"""
+        j0 = s - 1 - self.n
+        if j0 < 0 or self.C[j0] <= 0:
+            return None, None
+        ret = self.C[s - 1] / self.C[j0] - 1
+        return ("up" if ret >= self.thr else "down" if ret <= -self.thr else "flat"), ret
+
+
+_K2_TREND_NAME = {"up": "上漲", "down": "下跌", "flat": "整理"}
+
+
+def _k2_trend_ok(X, s, need, c):
+    if need is None:
+        return True
+    cls, ret = X.trend(s)
+    if cls is None:
+        return False
+    cond = {"down": cls == "down", "up": cls == "up", "notup": cls != "up", "notdown": cls != "down"}[need]
+    thr = f"{X.thr * 100:.1f}%"
+    rule = {
+        "down": f"前置下跌（≤ -{thr}）", "up": f"前置上漲（≥ +{thr}）",
+        "notup": f"前置非上漲（< +{thr}）", "notdown": f"前置非下跌（> -{thr}）",
+    }[need]
+    return c.ok(f"前置趨勢（型態前 {X.n} 根）", f"{ret * 100:+.1f}%（{_K2_TREND_NAME[cls]}）", rule, cond)
+
+
+def _k2_red(X, k, c, label):
+    return c.ok(label, f"開 {X.O[k]:.2f} → 收 {X.C[k]:.2f}", "收盤 > 開盤（紅K）", X.C[k] > X.O[k])
+
+
+def _k2_green(X, k, c, label):
+    return c.ok(label, f"開 {X.O[k]:.2f} → 收 {X.C[k]:.2f}", "收盤 < 開盤（綠K）", X.C[k] < X.O[k])
+
+
+def _k2_bodyx(X, k, c, label, mult):
+    r = X.body[k] / X.avgb[k]
+    return c.ok(label, f"實體 {X.body[k]:.2f}＝平均實體 {r:.1f} 倍", f"≥ 平均實體 × {mult}", r >= mult)
+
+
+def _k2_hammer_shape(X, i, c, inverted):
+    rng = X.rng[i]
+    if rng <= 0:
+        return False
+    long_s, short_s = (X.upper[i], X.lower[i]) if inverted else (X.lower[i], X.upper[i])
+    ln, sn = ("上影線", "下影線") if inverted else ("下影線", "上影線")
+    b = max(X.body[i], 1e-9)
+    return (
+        c.ok("小實體", f"實體 {X.body[i]:.2f}＝全距 {X.body[i] / rng * 100:.0f}%", f"≤ 全距 {K2_SMALL_BODY_RNG * 100:.0f}%",
+             X.body[i] <= K2_SMALL_BODY_RNG * rng)
+        and c.ok(f"長{ln}", f"{long_s:.2f}＝實體 {long_s / b:.1f} 倍、全距 {long_s / rng * 100:.0f}%",
+                 f"≥ 實體 2 倍，且 ≥ 全距 {K2_LONG_SHADOW_RNG * 100:.0f}%",
+                 long_s >= 2 * X.body[i] and long_s >= K2_LONG_SHADOW_RNG * rng)
+        and c.ok(f"短{sn}", f"{short_s:.2f}＝全距 {short_s / rng * 100:.0f}%", f"≤ 全距 {K2_SHORT_SHADOW_RNG * 100:.0f}%",
+                 short_s <= K2_SHORT_SHADOW_RNG * rng)
+    )
+
+
+def _k2_long_line(X, i, c, need, red):
+    if X.rng[i] <= 0:
+        return False
+    first = _k2_red(X, i, c, "收紅") if red else _k2_green(X, i, c, "收黑")
+    return (
+        first
+        and _k2_bodyx(X, i, c, "實體夠長", K2_LONG_BODY)
+        and c.ok("上下影線短", f"上 {X.upper[i]:.2f}／下 {X.lower[i]:.2f}", f"各 ≤ 實體 × {K2_SHORT_SHADOW}",
+                 X.upper[i] <= K2_SHORT_SHADOW * X.body[i] and X.lower[i] <= K2_SHORT_SHADOW * X.body[i])
+    )
+
+
+def _k2_engulf(X, i, c, need, bull):
+    a, b = i - 1, i
+    if bull:
+        ok = _k2_green(X, a, c, "第 1 根收黑") and _k2_red(X, b, c, "第 2 根收紅") and c.ok(
+            "第 2 根實體包住第 1 根", f"開 {X.O[b]:.2f} ≤ 前收 {X.C[a]:.2f}；收 {X.C[b]:.2f} ≥ 前開 {X.O[a]:.2f}",
+            "開盤 ≤ 前一根收盤，且收盤 ≥ 前一根開盤", X.O[b] <= X.C[a] and X.C[b] >= X.O[a])
+    else:
+        ok = _k2_red(X, a, c, "第 1 根收紅") and _k2_green(X, b, c, "第 2 根收黑") and c.ok(
+            "第 2 根實體包住第 1 根", f"開 {X.O[b]:.2f} ≥ 前收 {X.C[a]:.2f}；收 {X.C[b]:.2f} ≤ 前開 {X.O[a]:.2f}",
+            "開盤 ≥ 前一根收盤，且收盤 ≤ 前一根開盤", X.O[b] >= X.C[a] and X.C[b] <= X.O[a])
+    return ok and c.ok("實體比前一根大", f"{X.body[b]:.2f} > {X.body[a]:.2f}", "第 2 根實體 > 第 1 根實體",
+                       X.body[b] > X.body[a]) and _k2_trend_ok(X, a, need, c)
+
+
+def _k2_pierce(X, i, c, need, bull):
+    a, b = i - 1, i
+    mid = (X.O[a] + X.C[a]) / 2
+    if bull:
+        ok = (
+            _k2_green(X, a, c, "第 1 根收黑") and _k2_bodyx(X, a, c, "第 1 根實體明顯", K2_MID_BODY)
+            and _k2_red(X, b, c, "第 2 根收紅")
+            and c.ok("開盤不高於前收", f"開 {X.O[b]:.2f} ≤ 前收 {X.C[a]:.2f}", "開盤 ≤ 前一根收盤", X.O[b] <= X.C[a])
+            and c.ok("收盤深入前一根實體過半", f"收 {X.C[b]:.2f}；實體中點 {mid:.2f}；前開 {X.O[a]:.2f}",
+                     "中點 < 收盤 < 前一根開盤（未形成吞噬）", mid < X.C[b] < X.O[a])
+        )
+    else:
+        ok = (
+            _k2_red(X, a, c, "第 1 根收紅") and _k2_bodyx(X, a, c, "第 1 根實體明顯", K2_MID_BODY)
+            and _k2_green(X, b, c, "第 2 根收黑")
+            and c.ok("開盤不低於前收", f"開 {X.O[b]:.2f} ≥ 前收 {X.C[a]:.2f}", "開盤 ≥ 前一根收盤", X.O[b] >= X.C[a])
+            and c.ok("收盤深入前一根實體過半", f"收 {X.C[b]:.2f}；實體中點 {mid:.2f}；前開 {X.O[a]:.2f}",
+                     "前一根開盤 < 收盤 < 中點（未形成吞噬）", X.O[a] < X.C[b] < mid)
+        )
+    return ok and _k2_trend_ok(X, a, need, c)
+
+
+def _k2_harami(X, i, c, need, bull):
+    a, b = i - 1, i
+    first = _k2_green(X, a, c, "第 1 根收黑") if bull else _k2_red(X, a, c, "第 1 根收紅")
+    return (
+        first and _k2_bodyx(X, a, c, "第 1 根實體明顯", K2_MID_BODY)
+        and c.ok("第 2 根實體收進第 1 根實體內", f"{X.bot[b]:.2f}～{X.top[b]:.2f} 在 {X.bot[a]:.2f}～{X.top[a]:.2f} 內",
+                 "第 2 根實體上下緣都在第 1 根實體內", X.top[b] <= X.top[a] and X.bot[b] >= X.bot[a])
+        and c.ok("第 2 根實體較小", f"{X.body[b]:.2f} < {X.body[a]:.2f}", "第 2 根實體 < 第 1 根實體", X.body[b] < X.body[a])
+        and _k2_trend_ok(X, a, need, c)
+    )
+
+
+def _k2_star(X, i, c, need, bull):
+    a, m, b = i - 2, i - 1, i
+    mid1 = (X.O[a] + X.C[a]) / 2
+    if bull:
+        ok = _k2_green(X, a, c, "第 1 根收黑") and _k2_bodyx(X, a, c, "第 1 根實體明顯", K2_MID_BODY)
+        star_pos = X.top[m] <= mid1
+        pos_txt = f"星線實體上緣 {X.top[m]:.2f} ≤ 第 1 根實體中點 {mid1:.2f}"
+        third = _k2_red(X, b, c, "第 3 根收紅") and c.ok(
+            "第 3 根回到第 1 根實體內", f"收 {X.C[b]:.2f} > 中點 {mid1:.2f}", "收盤 > 第 1 根實體中點", X.C[b] > mid1)
+    else:
+        ok = _k2_red(X, a, c, "第 1 根收紅") and _k2_bodyx(X, a, c, "第 1 根實體明顯", K2_MID_BODY)
+        star_pos = X.bot[m] >= mid1
+        pos_txt = f"星線實體下緣 {X.bot[m]:.2f} ≥ 第 1 根實體中點 {mid1:.2f}"
+        third = _k2_green(X, b, c, "第 3 根收黑") and c.ok(
+            "第 3 根回到第 1 根實體內", f"收 {X.C[b]:.2f} < 中點 {mid1:.2f}", "收盤 < 第 1 根實體中點", X.C[b] < mid1)
+    return (
+        ok
+        and c.ok("中間為小實體", f"{X.body[m]:.2f}＝第 1 根的 {X.body[m] / max(X.body[a], 1e-9) * 100:.0f}%",
+                 f"≤ 第 1 根實體 × {K2_STAR_BODY}", X.body[m] <= K2_STAR_BODY * X.body[a])
+        and c.ok("星線位置", pos_txt, "星線落在第 1 根實體靠反向的一半", star_pos)
+        and third
+        and _k2_bodyx(X, b, c, "第 3 根實體明顯", K2_MID_BODY)
+        and _k2_trend_ok(X, a, need, c)
+    )
+
+
+def _k2_three_same(X, i, c, need, bull):
+    ks = [i - 2, i - 1, i]
+    for n_, k in enumerate(ks, 1):
+        if not (_k2_red(X, k, c, f"第 {n_} 根收紅") if bull else _k2_green(X, k, c, f"第 {n_} 根收黑")):
+            return False
+        if not c.ok(f"第 {n_} 根實體夠大", f"{X.body[k]:.2f}＝平均 {X.body[k] / X.avgb[k]:.1f} 倍",
+                    f"≥ 平均實體 × {K2_SOLDIER_BODY}", X.body[k] >= K2_SOLDIER_BODY * X.avgb[k]):
+            return False
+        sh = X.upper[k] if bull else X.lower[k]
+        if not c.ok(f"第 {n_} 根{'上' if bull else '下'}影線短", f"{sh:.2f}", f"≤ 實體 × {K2_SHORT_SHADOW}",
+                    sh <= K2_SHORT_SHADOW * X.body[k]):
+            return False
+    for n_ in (1, 2):
+        p, k = ks[n_ - 1], ks[n_]
+        if bull:
+            good = X.C[k] > X.C[p] and X.C[p] >= X.O[k] >= X.O[p]
+            thr = "收盤逐根墊高，且開盤落在前一根實體內"
+        else:
+            good = X.C[k] < X.C[p] and X.C[p] <= X.O[k] <= X.O[p]
+            thr = "收盤逐根走低，且開盤落在前一根實體內"
+        if not c.ok(f"第 {n_ + 1} 根相對第 {n_} 根", f"開 {X.O[k]:.2f}／收 {X.C[k]:.2f}（前收 {X.C[p]:.2f}）", thr, good):
+            return False
+    return _k2_trend_ok(X, ks[0], need, c)
+
+
+def _k2_three_inside(X, i, c, need, bull):
+    a, m, b = i - 2, i - 1, i
+    if bull:
+        ok = _k2_green(X, a, c, "第 1 根收黑") and _k2_red(X, m, c, "第 2 根收紅")
+    else:
+        ok = _k2_red(X, a, c, "第 1 根收紅") and _k2_green(X, m, c, "第 2 根收黑")
+    if not ok or not _k2_bodyx(X, a, c, "第 1 根實體明顯", K2_MID_BODY):
+        return False
+    if not c.ok("前兩根為母子結構", f"{X.bot[m]:.2f}～{X.top[m]:.2f} 在 {X.bot[a]:.2f}～{X.top[a]:.2f} 內",
+                "第 2 根實體收進第 1 根實體內且較小", X.top[m] <= X.top[a] and X.bot[m] >= X.bot[a] and X.body[m] < X.body[a]):
+        return False
+    if bull:
+        third = _k2_red(X, b, c, "第 3 根收紅") and c.ok(
+            "第 3 根向上延伸", f"收 {X.C[b]:.2f}（第 2 根收 {X.C[m]:.2f}、第 1 根開 {X.O[a]:.2f}）",
+            "收盤 > 第 2 根收盤，且 > 第 1 根開盤", X.C[b] > X.C[m] and X.C[b] > X.O[a])
+    else:
+        third = _k2_green(X, b, c, "第 3 根收黑") and c.ok(
+            "第 3 根向下延伸", f"收 {X.C[b]:.2f}（第 2 根收 {X.C[m]:.2f}、第 1 根開 {X.O[a]:.2f}）",
+            "收盤 < 第 2 根收盤，且 < 第 1 根開盤", X.C[b] < X.C[m] and X.C[b] < X.O[a])
+    return third and _k2_trend_ok(X, a, need, c)
+
+
+K2_DETECTORS = {
+    "長紅線": lambda X, i, c, n: _k2_long_line(X, i, c, n, True),
+    "長黑線": lambda X, i, c, n: _k2_long_line(X, i, c, n, False),
+    "錘子線": lambda X, i, c, n: _k2_hammer_shape(X, i, c, False) and _k2_trend_ok(X, i, n, c),
+    "吊人線": lambda X, i, c, n: _k2_hammer_shape(X, i, c, False) and _k2_trend_ok(X, i, n, c),
+    "倒錘子線": lambda X, i, c, n: _k2_hammer_shape(X, i, c, True) and _k2_trend_ok(X, i, n, c),
+    "射擊之星": lambda X, i, c, n: _k2_hammer_shape(X, i, c, True) and _k2_trend_ok(X, i, n, c),
+    "多頭吞噬": lambda X, i, c, n: _k2_engulf(X, i, c, n, True),
+    "空頭吞噬": lambda X, i, c, n: _k2_engulf(X, i, c, n, False),
+    "貫穿線": lambda X, i, c, n: _k2_pierce(X, i, c, n, True),
+    "烏雲罩頂": lambda X, i, c, n: _k2_pierce(X, i, c, n, False),
+    "多頭母子線": lambda X, i, c, n: _k2_harami(X, i, c, n, True),
+    "空頭母子線": lambda X, i, c, n: _k2_harami(X, i, c, n, False),
+    "晨星": lambda X, i, c, n: _k2_star(X, i, c, n, True),
+    "黃昏之星": lambda X, i, c, n: _k2_star(X, i, c, n, False),
+    "紅三兵": lambda X, i, c, n: _k2_three_same(X, i, c, n, True),
+    "三隻烏鴉": lambda X, i, c, n: _k2_three_same(X, i, c, n, False),
+    "三內升": lambda X, i, c, n: _k2_three_inside(X, i, c, n, True),
+    "三內降": lambda X, i, c, n: _k2_three_inside(X, i, c, n, False),
+}
+
+
+def k2_detect(df, n_trend, period, selected=None):
+    """掃描整段K線，回傳所有命中的型態：{name, g(幾根), direction, s, e, trend_txt, checks}。
+    selected 不為 None 時，只比對被選取的型態（未選取者不會出現在標註、重疊清單或條件比對）。"""
+    X = _K2Ctx(df, n_trend, period)
+    hits = []
+    for i in range(len(df)):
+        for name, g, direction, need in K2_PATTERNS:
+            if selected is not None and name not in selected:
+                continue
+            s = i - g + 1
+            if s < 1 or np.isnan(X.avgb[s:i + 1]).any() or (X.avgb[s:i + 1] <= 0).any():
+                continue
+            c = _K2Chk()
+            if not K2_DETECTORS[name](X, i, c, need):
+                continue
+            tr = "—"
+            if need is not None:
+                cls, ret = X.trend(s)
+                tr = f"{_K2_TREND_NAME[cls]} {ret * 100:+.1f}%"
+            hits.append({"name": name, "g": g, "direction": direction, "s": s, "e": i, "trend_txt": tr, "checks": c.rows})
+    return hits
+
+
+def k2_cluster(hits):
+    """把互相重疊的型態合成一組標註：以根數最多者為主要型態，其餘列為「+N」。"""
+    order = sorted(range(len(hits)), key=lambda k: (-hits[k]["g"], hits[k]["s"]))
+    taken, clusters = set(), []
+    for k in order:
+        if k in taken:
+            continue
+        h = hits[k]
+        taken.add(k)
+        members = [h]
+        for m in range(len(hits)):
+            if m not in taken and hits[m]["s"] <= h["e"] and hits[m]["e"] >= h["s"]:
+                taken.add(m)
+                members.append(hits[m])
+        clusters.append({
+            "primary": h, "members": members,
+            "s": min(x["s"] for x in members), "e": max(x["e"] for x in members),
+        })
+    clusters.sort(key=lambda x: (x["e"], x["s"]))
+    return clusters
+
+
+def k2_resample(hist, period):
+    """日K直接用；週K（週五結算）、月K、季K 先各自彙整 OHLC，再重新偵測型態（不是沿用日K的結果）。"""
+    d = hist[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Open", "High", "Low", "Close"])
+    if period == "日":
+        return d.tail(400)
+    rules = {"週": ["W-FRI"], "月": ["ME", "M"], "季": ["QE", "Q"]}[period]
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    for rule in rules:
+        try:
+            r = d.resample(rule).agg(agg)
+            break
+        except ValueError:
+            continue
+    return r.dropna(subset=["Open", "Close"])
+
+
+def _k2_fmt(ts, period):
+    if period == "月":
+        return ts.strftime("%Y-%m")
+    if period == "季":
+        return f"{ts.year}Q{(ts.month - 1) // 3 + 1}"
+    return ts.strftime("%Y-%m-%d")
+
+
+def k2_hit_levels(df, h):
+    """依型態的K棒位置，算出「想購買者」的進場區間與停損價（偏多型態），
+    或「持有者」的反彈減碼區間與跌破出場價（偏空型態）。回傳 {lo, hi, stop}。"""
+    seg = df.iloc[h["s"]:h["e"] + 1]
+    O, H, L, C = (seg[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
+    mid = lambda k: (O[k] + C[k]) / 2
+    low = float(L.min())
+    nm = h["name"]
+    # 每條規則用 lambda 包起來，只計算命中的那一個（避免單根／兩根型態去讀不存在的第 3 根K棒）
+    if h["direction"] == "bull":
+        rule = {
+            "長紅線": lambda: (mid(0), C[0]),                        # 回測實體中點～收盤
+            "錘子線": lambda: (C[0], H[0]),                          # 收盤～錘子線最高價
+            "倒錘子線": lambda: (H[0], H[0] * 1.01),                 # 需向上確認：站上最高價
+            "多頭吞噬": lambda: (mid(1), C[1]),                      # 第 2 根紅K實體中點～收盤
+            "貫穿線": lambda: (mid(1), C[1]),
+            "多頭母子線": lambda: (max(O[0], C[0]), max(O[0], C[0]) * 1.01),  # 需向上確認：站上第 1 根實體上緣
+            "晨星": lambda: (mid(2), C[2]),
+            "紅三兵": lambda: (O[2], C[2]),                          # 第 3 根開盤～收盤
+            "三內升": lambda: (C[1], C[2]),                          # 第 2 根收盤～第 3 根收盤
+        }[nm]()
+        stop = low                                                   # 跌破型態最低價，型態失效
+    else:
+        rule = {
+            "長黑線": lambda: (C[0], mid(0)),                        # 反彈到實體中點
+            "吊人線": lambda: (C[0], H[0]),
+            "射擊之星": lambda: (C[0], H[0]),
+            "空頭吞噬": lambda: (C[1], mid(1)),
+            "烏雲罩頂": lambda: (C[1], (O[0] + C[0]) / 2),           # 反彈到第 1 根實體中點
+            "空頭母子線": lambda: (C[1], H[1]),
+            "黃昏之星": lambda: (C[2], mid(2)),
+            "三隻烏鴉": lambda: (C[2], O[2]),                        # 反彈到第 3 根開盤
+            "三內降": lambda: (C[2], C[1]),
+        }[nm]()
+        stop = min(O[0], C[0]) if nm == "空頭母子線" else low        # 母子線以第 1 根實體下緣為轉弱確認
+    lo, hi = float(min(rule)), float(max(rule))
+    return {"lo": lo, "hi": hi, "stop": float(stop)}
+
+
+def _k2_range_txt(lo, hi):
+    return _pz(lo) if abs(hi - lo) <= 0.005 else f"{_pz(lo)}～{_pz(hi)}"
+
+
+def _render_k2_price_blocks(df, clusters, period):
+    """K線分析2 的兩個價位區塊：想購買者的建議進場價、持有者的想退場價格。"""
+    n = len(df)
+    px = float(df["Close"].iloc[-1])
+    recent = [cl for cl in clusters if cl["e"] >= n - 3]
+    bull_hits = [m for cl in recent for m in cl["members"] if m["direction"] == "bull"]
+    bear_hits = [m for cl in recent for m in cl["members"] if m["direction"] == "bear"]
+
+    # 通用價位：近 20 根的支撐／壓力，以及 ATR（用同一週期的K棒估算波動）
+    w = df.tail(20)
+    sup, res = float(w["Low"].min()), float(w["High"].max())
+    prev_c = df["Close"].shift(1)
+    tr = pd.concat([df["High"] - df["Low"], (df["High"] - prev_c).abs(), (df["Low"] - prev_c).abs()], axis=1).max(axis=1)
+    atr = float(tr.tail(14).mean())
+    ma5 = float(df["Close"].tail(5).mean())
+
+    st.markdown(f"**📌 進出場價格參考**（以目前選擇的{period}K計算，現價＝最新一根{period}K收盤 {px:.2f}）")
+    col_b, col_s = st.columns(2)
+
+    with col_b, st.container(border=True):
+        st.markdown("##### 📈 想購買者：建議進場價")
+        if bull_hits:
+            for h in bull_hits:
+                lv = k2_hit_levels(df, h)
+                if px < lv["stop"]:
+                    status = "❌ 現價已跌破型態停損價，型態失效，暫不進場。"
+                elif lv["lo"] <= px <= lv["hi"]:
+                    status = "✅ 現價就在建議進場區內。"
+                elif px > lv["hi"]:
+                    status = "⏳ 現價高於進場區，不追高，等回測再進。"
+                else:
+                    status = "⏳ 現價低於進場區，等站回進場區再進。"
+                st.markdown(
+                    f"**▲ {h['name']}**（{_k2_fmt(df.index[h['e']], period)}）\n\n"
+                    f"- 建議進場價：{_k2_range_txt(lv['lo'], lv['hi'])}\n"
+                    f"- 停損價：跌破 {_pz(lv['stop'])} 型態失效\n"
+                    f"- {status}",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption(f"最近 3 根{period}K 沒有偏多型態，以下為通用價位。")
+        if bear_hits:
+            st.warning("同時出現偏空型態：" + "、".join(h["name"] for h in bear_hits) + "，進場宜保守、縮小部位。")
+        st.markdown(
+            "**通用價位**（不依型態）\n"
+            f"- 🛡️ 回測支撐 {_k2_range_txt(sup, sup + 0.5 * atr)} 止穩再進場，停損 {_pz(sup - 0.5 * atr)}\n"
+            f"- 🚀 收盤站上壓力 {_pz(res)} 且量能放大再進場，進場區 {_k2_range_txt(res, res + 0.5 * atr)}，停損 {_pz(res - atr)}（跌回壓力下方視為突破失敗）",
+            unsafe_allow_html=True,
+        )
+
+    with col_s, st.container(border=True):
+        st.markdown("##### 📉 持有者：想退場價格")
+        if bear_hits:
+            for h in bear_hits:
+                lv = k2_hit_levels(df, h)
+                if px < lv["stop"]:
+                    status = "⚠️ 現價已跌破出場價，已觸發出場；可等反彈到減碼區再賣，不宜再凹單。"
+                elif px < lv["lo"]:
+                    status = "⏳ 現價低於減碼區，反彈到減碼區逢高賣；跌破出場價就出場。"
+                elif px <= lv["hi"]:
+                    status = "⚠️ 現價就在減碼區內，可分批減碼。"
+                else:
+                    status = "⏳ 現價高於減碼區，型態轉弱尚未被價格確認，留意跌破出場價。"
+                st.markdown(
+                    f"**▼ {h['name']}**（{_k2_fmt(df.index[h['e']], period)}）\n\n"
+                    f"- 反彈減碼價：{_k2_range_txt(lv['lo'], lv['hi'])}\n"
+                    f"- 跌破出場價：{_pz(lv['stop'])}\n"
+                    f"- {status}",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption(f"最近 3 根{period}K 沒有偏空型態，以下為通用價位。")
+        if bull_hits:
+            st.info("同時出現偏多型態：" + "、".join(h["name"] for h in bull_hits) + "，可考慮續抱，但仍要設好出場價。")
+        st.markdown(
+            "**通用價位**（不依型態）\n"
+            f"- 🛡️ 收盤跌破近 20 根支撐 {_pz(sup)} 就出場（若現價已低於此價，改看反彈到此價附近是否站得回）\n"
+            f"- 🎯 逼近壓力 {_k2_range_txt(res - 0.5 * atr, res)} 量縮不過，先減碼\n"
+            f"- 📉 收盤跌破 5 根均價 {_pz(ma5)}，先減碼保護獲利",
+            unsafe_allow_html=True,
+        )
+    st.caption("價位是依型態與近期高低點算出的參考，不是保證；進場後務必先設好停損，跌破就執行。")
+
+
+def _kline2_start():
+    """等同於在「個股分析」搜尋，所有頁籤會一起切換到這檔股票。"""
+    request_search(st.session_state.get("kline2_input", ""))
+
+
+def render_kline_analysis2():
+    st.markdown("##### 📐 K線分析2：18 種K線型態標註（參考處置王「K線技術分析教學」）")
+    mobile_ = is_mobile()
+    c1, c2 = (st.container(), st.container()) if mobile_ else st.columns([3, 1], vertical_alignment="bottom")
+    with c1:
+        st.text_input(
+            "股票代號或中文名稱（搜尋後所有頁籤同步顯示這檔股票）",
+            key="kline2_input",
+            on_change=_kline2_start,
+        )
+    with c2:
+        st.button("📐 開始分析", type="primary", key="kline2_btn", on_click=_kline2_start,
+                  width="stretch" if mobile_ else "content")
+
+    period = st.radio("K線週期", ["日", "週", "月", "季"], horizontal=True, key="k2_period",
+                      format_func=lambda p: f"{p}K")
+    opts = K2_BARS[period]
+    bars = st.radio("圖表範圍", opts, index=min(1, len(opts) - 1), horizontal=True, key=f"k2_rng_{period}",
+                    format_func=lambda n: f"近 {n} {K2_UNIT[period]}")
+
+    with st.expander("⚙️ K線設定：型態顯示與前置趨勢", expanded=False):
+        on = st.toggle("顯示型態標註", value=True, key="k2_on")
+        n_trend = st.radio(
+            "前置趨勢判定（看型態前幾根K）", [3, 5, 10], index=1, horizontal=True, key="k2_trend",
+            format_func=lambda n: f"{n} 根", help="3 根較快反映近期方向，5 根兼顧近期變化與穩定度，10 根觀察較長一段行情；"
+            "依週期分別代表日、週、月、季。",
+        )
+        selected = set()
+        for g, title in ((1, "單根K"), (2, "兩根K"), (3, "三根K")):
+            names = [p[0] for p in K2_PATTERNS if p[1] == g]
+            dirs = {p[0]: p[2] for p in K2_PATTERNS}
+            picked = st.multiselect(
+                f"{title}型態", names, default=[n for n in names if n not in K2_DEFAULT_OFF], key=f"k2_sel{g}",
+                format_func=lambda n, dirs=dirs: f"{'▲' if dirs[n] == 'bull' else '▼'} {n}",
+            )
+            selected.update(picked)
+        st.caption("▲ 偏多分類／▼ 偏空分類。長紅線與長黑線預設關閉（它們不限定前置趨勢，容易大量出現），可手動開啟。"
+                   "未選取的型態不會出現在標註、重疊清單與條件比對中。")
+
+    symbol, cur_name, failed = current_stock()
+    if failed is not None:
+        st.error(f"❌ 找不到「{failed}」的相關股票資料。請檢查輸入是否正確。")
+        _render_k2_help()
+        return
+    if not symbol:
+        st.info("請輸入股票代號或名稱後按「開始分析」；搜尋結果會與「個股分析」、「K線分析」同步。")
+        _render_k2_help()
+        return
+
+    with st.spinner("⏳ 載入資料中，請稍候…"):
+        hist, valid = pd.DataFrame(), None
+        for cand in [symbol] + ([symbol[:-3] + ".TWO"] if symbol.endswith(".TW") else []):
+            try:
+                hist = fetch_history(cand, "10y")  # 月K、季K 需要較長的歷史
+            except Exception:
+                continue
+            if not hist.empty:
+                valid = cand
+                break
+        if valid is None:
+            st.error(f"❌ 找不到「{symbol}」的股價資料。")
+            return
+        name = cur_name or resolve_display_name(valid, "")
+        df = k2_resample(hist, period)
+
+    if len(df) < 15:
+        st.warning(f"{period}K 資料不足（只有 {len(df)} 根），無法判斷型態；請改選較短的週期。")
+        return
+
+    hits = k2_detect(df, n_trend, period, selected) if on else []
+    clusters = k2_cluster(hits)
+    n = len(df)
+    start = max(0, n - bars)
+    shown_cl = [cl for cl in clusters if cl["e"] >= start]
+
+    st.subheader(f"{name} ({valid})")
+    last_close = float(df["Close"].iloc[-1])
+    prev_close = float(df["Close"].iloc[-2])
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(f"{period}K 最新收盤", f"{last_close:.2f}", f"{last_close - prev_close:+.2f} ({(last_close / prev_close - 1) * 100:+.2f}%)",
+              delta_color="inverse")
+    m2.metric("標註數", f"{len(shown_cl)}")
+    m3.metric("▲ 偏多分類", f"{sum(1 for cl in shown_cl if cl['primary']['direction'] == 'bull')}")
+    m4.metric("▼ 偏空分類", f"{sum(1 for cl in shown_cl if cl['primary']['direction'] == 'bear')}")
+    if period != "日":
+        st.caption(f"⏳ 最後一根{period}K（{_k2_fmt(df.index[-1], period)}）若尚未結束，會隨新行情變動，型態結果也可能更新。")
+
+    recent = [cl for cl in clusters if cl["e"] >= n - 3]
+    if recent:
+        txt = "、".join(
+            f"{'▲' if cl['primary']['direction'] == 'bull' else '▼'}{cl['primary']['name']}"
+            + (f"（+{len(cl['members']) - 1}）" if len(cl["members"]) > 1 else "")
+            + f"［{_k2_fmt(df.index[cl['e']], period)}］"
+            for cl in recent
+        )
+        st.info(f"🔎 最近 3 根{period}K 內的型態：{txt}。箭頭只是型態的方向分類，不是買進或賣出訊號；請搭配前高前低、成交量與後續K棒一起看。")
+    else:
+        st.caption(f"最近 3 根{period}K 內沒有符合條件的型態。")
+
+    # ---- K 線圖 ----
+    shown = df.iloc[start:]
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=shown.index, open=shown["Open"], high=shown["High"], low=shown["Low"], close=shown["Close"],
+        name=f"{period}K", increasing_line_color="red", decreasing_line_color="green",
+    ))
+    if len(shown) > 1:
+        pad = (shown.index[1:] - shown.index[:-1]).to_series().median() / 2
+    else:
+        pad = pd.Timedelta(days=1)
+    bull_pts, bear_pts = {"x": [], "y": [], "t": [], "h": []}, {"x": [], "y": [], "t": [], "h": []}
+    for cl in shown_cl:
+        s_, e_ = max(cl["s"], start), cl["e"]
+        seg = df.iloc[s_:e_ + 1]
+        lo, hi = float(seg["Low"].min()), float(seg["High"].max())
+        fig.add_shape(
+            type="rect", x0=df.index[s_] - pad * 0.9, x1=df.index[e_] + pad * 0.9, y0=lo * 0.997, y1=hi * 1.003,
+            line=dict(color="#ffd166", width=1.5), fillcolor="rgba(255,209,102,0.06)",
+        )
+        p = cl["primary"]
+        label = p["name"] + (f" +{len(cl['members']) - 1}" if len(cl["members"]) > 1 else "")
+        hover = "<br>".join(
+            f"{'▲' if m['direction'] == 'bull' else '▼'}{m['name']}（{K2_DIR_TXT[m['direction']]}，{m['g']} 根，前置趨勢：{m['trend_txt']}）"
+            for m in cl["members"]
+        )
+        tgt = bull_pts if p["direction"] == "bull" else bear_pts
+        tgt["x"].append(df.index[e_])
+        tgt["y"].append(lo * 0.985 if p["direction"] == "bull" else hi * 1.015)
+        tgt["t"].append(label)
+        tgt["h"].append(f"{_k2_fmt(df.index[cl['s']], period)}～{_k2_fmt(df.index[cl['e']], period)}<br>{hover}")
+    for pts, nm, sym, color, pos in (
+        (bull_pts, "偏多分類", "triangle-up", "red", "bottom center"),
+        (bear_pts, "偏空分類", "triangle-down", "green", "top center"),
+    ):
+        if pts["x"]:
+            fig.add_trace(go.Scatter(
+                x=pts["x"], y=pts["y"], mode="markers+text", name=nm,
+                marker=dict(symbol=sym, size=11, color=color), text=pts["t"], textposition=pos,
+                textfont=dict(size=10, color=color), hovertext=pts["h"], hoverinfo="text",
+            ))
+    fig.update_layout(title=f"{name} {period}K 型態標註", template="plotly_dark",
+                      xaxis_rangeslider_visible=False, yaxis_title="價格")
+    if period == "日":
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    show_chart(fig)
+
+    # ---- 進出場價格參考：想購買者／持有者 ----
+    _render_k2_price_blocks(df, clusters, period)
+
+    # ---- 標註明細 ----
+    st.markdown(f"**📋 型態標註明細**（共 {len(shown_cl)} 組，新 → 舊）")
+    if shown_cl:
+        rows = []
+        for cl in reversed(shown_cl):
+            p = cl["primary"]
+            span = _k2_fmt(df.index[cl["s"]], period)
+            if cl["e"] != cl["s"]:
+                span += f"～{_k2_fmt(df.index[cl['e']], period)}"
+            rows.append({
+                "涵蓋日期": span,
+                "主要型態": p["name"],
+                "方向分類": ("▲ " if p["direction"] == "bull" else "▼ ") + K2_DIR_TXT[p["direction"]],
+                "前置趨勢": p["trend_txt"],
+                "重疊型態": "、".join(m["name"] for m in cl["members"] if m is not p) or "—",
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=min(420, 38 * (len(rows) + 1)))
+
+        # ---- 條件比對 ----
+        st.markdown("**🔎 條件比對**（選一組標註，看每個型態的判斷項目、本次實際值與門檻）")
+        opts_cl = list(reversed(shown_cl))
+        labels = [
+            f"{_k2_fmt(df.index[cl['e']], period)}　{cl['primary']['name']}"
+            + (f"（+{len(cl['members']) - 1}）" if len(cl["members"]) > 1 else "")
+            for cl in opts_cl
+        ]
+        pick = st.selectbox("選擇標註", range(len(opts_cl)), format_func=lambda k: labels[k], key=f"k2_pick_{valid}_{period}")
+        for m in sorted(opts_cl[pick]["members"], key=lambda x: (-x["g"], x["s"])):
+            st.markdown(
+                f"**{'▲' if m['direction'] == 'bull' else '▼'} {m['name']}**（{K2_DIR_TXT[m['direction']]}分類，{m['g']} 根K："
+                f"{_k2_fmt(df.index[m['s']], period)}～{_k2_fmt(df.index[m['e']], period)}）"
+            )
+            st.dataframe(
+                pd.DataFrame(m["checks"], columns=["判斷項目", "本次實際值", "判斷門檻", "結果"]),
+                width="stretch", hide_index=True,
+            )
+    else:
+        st.caption("這個範圍內沒有符合條件的型態。可以試試較短的前置趨勢（3 根）、較長的圖表範圍，或到設定開啟長紅線／長黑線。")
+
+    st.caption(
+        "⚠️ 型態只描述一至三根K棒的價格結構，不保證後續漲跌；箭頭是方向分類，不是買賣建議。"
+        "本頁門檻為常見慣例，與處置王 APP 的實際門檻可能不同，請以上方「條件比對」為準。"
+    )
+    _render_k2_help()
+
+
+def _render_k2_help():
+    with st.expander("📖 18 種型態與本頁判斷條件（參考處置王教學）"):
+        thr_pct = {p: f"{K2_TREND_BASE[p] * 100:.1f}%" for p in K2_TREND_BASE}
+        st.markdown(
+            f"""
+**怎麼判斷**：先比對 1～3 根K棒的價格結構，再檢查「前置趨勢」。除長紅線、長黑線外，其餘 16 種都必須符合前置趨勢才會標註。
+
+**前置趨勢**：看型態第一根之前的 N 根（可選 3／5／10 根，預設 5）收盤漲跌幅。漲跌幅達門檻才算上漲或下跌，否則視為整理。
+門檻（N＝5 時）：日K {thr_pct['日']}、週K {thr_pct['週']}、月K {thr_pct['月']}、季K {thr_pct['季']}；N 不同時依 √(N/5) 調整。
+週K、月K、季K 會先把日行情彙整成各週期的開高低收，再重新比對型態，不是沿用日K結果。
+
+**通用定義**：平均實體＝前 20 根K棒實體的平均；長實體＝實體 ≥ 平均實體 {K2_LONG_BODY} 倍；較明顯實體＝≥ {K2_MID_BODY} 倍。
+
+| 型態 | 方向分類 | 結構條件 | 前置趨勢 |
+|---|---|---|---|
+| 長紅線／長黑線 | 偏多／偏空 | 收紅（黑）、長實體、上下影線各 ≤ 實體 {int(K2_SHORT_SHADOW * 100)}% | 不限 |
+| 錘子線／吊人線 | 偏多／偏空 | 小實體（≤ 全距 {int(K2_SMALL_BODY_RNG * 100)}%）、下影線 ≥ 實體 2 倍且 ≥ 全距 {int(K2_LONG_SHADOW_RNG * 100)}%、上影線 ≤ 全距 {int(K2_SHORT_SHADOW_RNG * 100)}% | 下跌後＝錘子線；上漲後＝吊人線 |
+| 倒錘子線／射擊之星 | 偏多／偏空 | 同上但上下影線相反（長上影） | 下跌後＝倒錘子線；上漲後＝射擊之星 |
+| 多頭／空頭吞噬 | 偏多／偏空 | 第 2 根實體完整包住第 1 根實體，且實體較大 | 下跌後／上漲後 |
+| 貫穿線／烏雲罩頂 | 偏多／偏空 | 第 1 根明顯實體；第 2 根反向、開盤不越過前收，收盤深入第 1 根實體過半但未吞噬 | 下跌後／上漲後 |
+| 多頭／空頭母子線 | 偏多／偏空 | 第 1 根明顯實體；第 2 根實體完全收進第 1 根實體內且較小（顏色不限） | 下跌後／上漲後 |
+| 晨星／黃昏之星 | 偏多／偏空 | 明顯實體 → 小實體（≤ 第 1 根 {int(K2_STAR_BODY * 100)}%，且在第 1 根實體靠反向的一半）→ 反向明顯實體，收盤回到第 1 根實體中點之內 | 下跌後／上漲後 |
+| 紅三兵／三隻烏鴉 | 偏多／偏空 | 三根同色、實體 ≥ 平均 {K2_SOLDIER_BODY} 倍、收盤逐根墊高（走低）、開盤在前一根實體內、影線短 | 非上漲／非下跌（含整理） |
+| 三內升／三內降 | 偏多／偏空 | 前兩根為母子結構（第 2 根同向反轉色），第 3 根收盤超過第 2 根收盤且越過第 1 根開盤 | 下跌後／上漲後 |
+
+**重疊標註**：不同型態可能共用同一根K，例如三內升包含多頭母子線。重疊的型態合成一個金框，以根數最多者為主要型態，標籤的「+N」代表另有 N 個重疊型態；命中數量只是結構關係，不是訊號強度。
+
+**進出場價格怎麼算**（價位依型態K棒的位置，加上近 20 根高低點與 ATR；週／月／季K 就用該週期的K棒計算）
+
+| 偏多型態（想購買者） | 建議進場價 | 停損價 |
+|---|---|---|
+| 長紅線 | 實體中點～收盤 | 型態最低價 |
+| 錘子線 | 收盤～最高價 | 型態最低價 |
+| 倒錘子線 | 最高價～最高價 +1%（需向上確認） | 型態最低價 |
+| 多頭吞噬／貫穿線 | 第 2 根實體中點～收盤 | 型態最低價 |
+| 多頭母子線 | 第 1 根實體上緣～+1%（需向上確認） | 型態最低價 |
+| 晨星 | 第 3 根實體中點～收盤 | 型態最低價 |
+| 紅三兵 | 第 3 根開盤～收盤 | 型態最低價 |
+| 三內升 | 第 2 根收盤～第 3 根收盤 | 型態最低價 |
+
+| 偏空型態（持有者） | 反彈減碼價 | 跌破出場價 |
+|---|---|---|
+| 長黑線 | 收盤～實體中點 | 型態最低價 |
+| 吊人線／射擊之星 | 收盤～最高價 | 型態最低價 |
+| 空頭吞噬 | 第 2 根收盤～實體中點 | 型態最低價 |
+| 烏雲罩頂 | 第 2 根收盤～第 1 根實體中點 | 型態最低價 |
+| 空頭母子線 | 第 2 根收盤～最高價 | 第 1 根實體下緣 |
+| 黃昏之星 | 第 3 根收盤～實體中點 | 型態最低價 |
+| 三隻烏鴉 | 第 3 根收盤～第 3 根開盤 | 型態最低價 |
+| 三內降 | 第 3 根收盤～第 2 根收盤 | 型態最低價 |
+
+只針對「最近 3 根K線內」出現的型態給價位；現價已經跌破停損（出場）價時，會直接標示型態失效或已觸發出場。
+通用價位：支撐＝近 20 根最低價、壓力＝近 20 根最高價、ATR＝近 14 根平均真實波幅；回測支撐進場區＝支撐～支撐＋0.5ATR，停損＝支撐－0.5ATR。
+
+**限制**：處置王只公開結構說明，沒有公開精確門檻（長短實體、影線、跳空、深入幅度等），本頁採用上列常見慣例。
+同一型態在不同看盤工具結果不同很正常，請以「條件比對」表確認每一項數值。
+"""
+        )
+
+
+# ---------------------------------------------------------------------------
 # 主畫面：輸入區
 # ---------------------------------------------------------------------------
-tab_stock, tab_kline, tab_rank, tab_inst = st.tabs(
-    ["🔍 個股分析", "📐 K線分析", "🔥 即時市場排行", "🏦 前一交易日買超賣超"]
+tab_stock, tab_kline, tab_kline2, tab_rank, tab_inst = st.tabs(
+    ["🔍 個股分析", "📐 K線分析", "📐 K線分析2", "🔥 即時市場排行", "🏦 前一交易日買超賣超"]
 )
-
-# K線分析頁籤：輸入欄位不需連線，先渲染，打開就看得到（不必等其他頁籤載入完）
-with tab_kline:
-    render_kline_analysis()
 
 with tab_stock:
     mobile = is_mobile()
@@ -3766,6 +4509,14 @@ with tab_stock:
         with result_slot.container():
             with st.spinner(f"⏳ 載入「{pending}」資料中，請稍候…"):
                 run_search(pending)
+
+# K線分析頁籤：放在搜尋處理之後、較慢的個股分析結果之前渲染。
+# 這樣不論是在哪個頁籤搜尋，這裡讀到的都是最新的「目前股票」，三個頁籤會同步顯示同一檔股票。
+with tab_kline:
+    render_kline_analysis()
+
+with tab_kline2:
+    render_kline_analysis2()
 
 # ---------------------------------------------------------------------------
 # 側邊欄：搜尋紀錄
