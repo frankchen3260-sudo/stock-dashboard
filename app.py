@@ -456,7 +456,7 @@ def render_institutional(symbol):
     stock_id = symbol.split(".")[0]
     source = "證交所／櫃買中心公開資料"
     table = None
-    with st.spinner("讀取法人資料中（第一次約需數秒）..."):
+    with st.spinner("分析中：讀取法人資料（第一次約需數秒）..."):
         try:
             table = fetch_institutional_official(symbol, days=10)
         except Exception as official_err:
@@ -1160,7 +1160,7 @@ def render_news(symbol, display_name):
     st.divider()
     st.subheader("📰 近期新聞")
     try:
-        with st.spinner("讀取新聞中..."):
+        with st.spinner("分析中：讀取新聞中..."):
             items = fetch_news(symbol, display_name)
     except Exception as e:
         st.warning(f"⚠️ 目前無法取得新聞：{e}")
@@ -1937,8 +1937,8 @@ if "search_stopped" not in st.session_state:
     st.session_state.search_stopped = False
 
 
-# 各頁籤的搜尋輸入框；任一頁籤搜尋時，其餘輸入框也同步成同一個關鍵字
-SEARCH_INPUT_KEYS = ("input_val", "kline_input", "kline2_input")
+# 全站共用的搜尋輸入框（放在頁籤上方）
+SEARCH_INPUT_KEYS = ("input_val",)
 
 
 def request_search(keyword):
@@ -2025,7 +2025,7 @@ def run_search(user_keyword):
 def render_analysis(symbol_upper, time_period):
     beacon_slot = None
     try:
-        with st.spinner("⏳ 載入資料中，請稍候…"):
+        with st.spinner("⏳ 分析中，請稍候…"):
             df = fetch_history(symbol_upper, time_period)
             info, dividends_series, splits_series, eps_quarterly, monthly_df = (
                 fetch_fundamentals(symbol_upper)
@@ -2531,7 +2531,7 @@ def _market_rank_body():
     bucket = _rank_bucket()
     data, errors = None, []
     first_load = not st.session_state.get("_rank_loaded", False)
-    with st.spinner("⏳ 載入資料中，請稍候…") if first_load else contextlib.nullcontext():
+    with st.spinner("⏳ 分析中，請稍候…") if first_load else contextlib.nullcontext():
         for label, fn in (
             ("證交所即時行情", fetch_market_rank),
             ("Fugle", fetch_market_rank_fugle),
@@ -2722,7 +2722,7 @@ def _render_rank_table(df, title, color):
 def render_prev_day_institutional_rank():
     st.markdown("##### 🏦 前一交易日 三大法人買超／賣超 前 20 名")
     try:
-        with st.spinner("⏳ 載入資料中，請稍候…"):
+        with st.spinner("⏳ 分析中，請稍候…"):
             df, day_str, otc_ok, source, main_err = fetch_prev_day_institutional_rank()
     except Exception as e:
         st.warning(f"⚠️ 目前無法取得法人買賣超資料：{e}")
@@ -3343,76 +3343,65 @@ def _render_prediction(d, sigs, inst_table=None):
         where = "股價目前就在此區內" if zlo <= close <= zhi else f"在股價下方 {(close / zhi - 1) * 100:.1f}%"
         zone_txt = f"📊 **下檔大量支撐區 {zlo:.2f}～{zhi:.2f}**（約佔近 {VOL_PROFILE_WINDOW} 日成交量 {share * 100:.0f}%，{where}）"
 
-    recent_sigs = [s for s in sigs if s["idx"] >= n - 3]
-    buy_sigs = [s for s in recent_sigs if s["kind"] == "entry"]
-    sell_sigs = [s for s in recent_sigs if s["kind"] == "exit"]
-
-    # ---- 買方角度 ----
+    # ---- 想買的人 ----
     if verdict == "bull":
-        b_stance = "✅ **偏多：可分批進場**"
-        b_lines = [
-            f"- 📈 **進場**：開盤後回測 {_pz_range(close - 0.5 * atr, close)} 分批買進；若開盤直接跳空超過 {_pz(close + atr)} 不追價。",
-            f"- 🛡️ **停損**：跌破 {_pz(support)} 出場。",
-            f"- 🎯 **第一目標／壓力**：{_pz(resist)} 附近，量縮不過可先減碼。",
-        ]
-    elif verdict == "bear":
-        b_stance = "⛔ **偏空：空手者不宜進場**"
-        b_lines = [
-            f"- 🔄 **重新考慮進場**：站回 {_pz(resist)} 且量能放大（≥ 5 日均量 1.5 倍）。",
-            f"- 🚫 若開盤直接跌破 {_pz(close - atr)}，不宜接刀，等止跌型態（錘形線、多頭吞噬、早晨之星）。",
-        ]
+        b_stance = "✅ **偏多：可以分批買**"
+        b_lo, b_hi = close - 0.5 * atr, close
+        b_how = f"開盤後回到這區再買；若一開盤就跳空到 {_pz(close + atr)} 以上，就不要追"
+        b_stop = support
+        b_tgt = resist if resist > close + 0.5 * atr else close + 2 * atr
     else:
-        b_stance = "⏳ **多空不明：觀望**"
-        b_lines = [
-            f"- 👀 **進場條件**：收盤站上 {_pz(resist)} 且成交量放大（≥ 5 日均量 1.5 倍）再進場。",
-            f"- 🛡️ **進場後停損**：收盤跌破 {_pz(support)} 就放棄。",
-        ]
+        b_stance = "⛔ **偏空：現在先不要買**" if verdict == "bear" else "⏳ **多空不明：先觀望**"
+        b_lo, b_hi = resist, resist + 0.5 * atr
+        b_how = "收盤站上這個價、而且量也放大，才考慮買"
+        b_stop = max(support, resist - atr)
+        b_tgt = resist + 2 * atr
+    b_lines = [
+        f"- 🟢 **買進價**：{_pz_range(b_lo, b_hi)}　{b_how}",
+        f"- 🛑 **停損價**：{_pz(b_stop)}　跌破就賣，認賠不要拗",
+        f"- 🎯 **獲利價**：{_pz(b_tgt)}　漲到這附近可以先賣掉",
+    ]
     if zone:
         b_lines.append(
-            f"- {zone_txt}：回測此區且量縮止穩，可在 {_pz_range(zlo, zhi)} 低風險切入，停損 {_pz(zlo * ZONE_BREAK_PCT)}。"
+            f"- 🧱 **另一個買點**：{_pz_range(zlo, zhi)}（下檔大量支撐區）　回測到這區、量縮止穩才買；"
+            f"收盤跌破 {_pz(zlo * ZONE_BREAK_PCT)} 就不要買"
         )
 
-    # ---- 賣方角度 ----
+    # ---- 持有的人 ----
     if verdict == "bull":
-        s_stance = "✅ **偏多：持股續抱**"
-        s_lines = [
-            f"- 🛡️ **停損**：跌破 {_pz(support)} 出場。",
-            f"- 🎯 **減碼參考**：{_pz(resist)} 附近，量縮不過可先減碼。",
-        ]
+        s_stance = "✅ **偏多：可以續抱**"
+        s_lo, s_hi = resist - 0.5 * atr, resist
+        s_how = "漲到這區、量縮過不去，先賣一部分"
     elif verdict == "bear":
-        s_stance = "⚠️ **偏空：適合出場／減碼**"
-        s_lines = [
-            f"- 📉 **出場／減碼**：開盤逢反彈 {_pz_range(close, close + 0.5 * atr)} 先賣；若開盤直接跌破 {_pz(close - atr)} 不宜再凹單。",
-            f"- 🛡️ **全數出場**：跌破 {_pz(support)}。",
-        ]
+        s_stance = "⚠️ **偏空：有持股建議先減倉**"
+        s_lo, s_hi = close, close + 0.5 * atr
+        s_how = "開盤逢反彈到這區，先賣一部分"
     else:
-        s_stance = "⏳ **多空不明：持股不動作**"
-        s_lines = [
-            f"- 🚪 **出場條件**：收盤跌破 {_pz(support)} 就減碼／出場。",
-            f"- ⏳ 區間內（{support:.2f}～{resist:.2f}）不動作，等方向。",
-        ]
+        s_stance = "⏳ **多空不明：先不動作**"
+        s_lo, s_hi = resist - 0.5 * atr, resist
+        s_how = "漲到這區、量縮過不去，先賣一部分"
+    s_lines = [
+        f"- 🟡 **減倉價**：{_pz_range(s_lo, s_hi)}　{s_how}",
+        f"- 🛑 **停損價**：{_pz(support)}　收盤跌破就全部賣掉",
+    ]
+    if verdict == "bear":
+        s_lines.append(f"- ⚠️ 若一開盤就直接跌破 {_pz(close - atr)}，不要再凹單，直接出場")
     if zone:
         s_lines.append(
-            f"- {zone_txt}：收盤跌破 {_pz(zlo * ZONE_BREAK_PCT)}（被長黑有效跌破）代表支撐失效，必須停損。"
+            f"- 🧱 下檔大量支撐區 {_pz_range(zlo, zhi)}：收盤跌破 {_pz(zlo * ZONE_BREAK_PCT)} 代表支撐失效，必須停損"
         )
 
     st.markdown("**📌 隔日進出場參考**")
     col_b, col_s = st.columns(2)
-    for col, title, stance, lines, sig_list, sig_title in (
-        (col_b, "📈 買方角度（空手／想進場）", b_stance, b_lines, buy_sigs, "近 3 日進場訊號價位"),
-        (col_s, "📉 賣方角度（持股／想出場）", s_stance, s_lines, sell_sigs, "近 3 日出場訊號價位"),
+    for col, title, stance, lines in (
+        (col_b, "📈 想買的人：什麼價位進、什麼價位出", b_stance, b_lines),
+        (col_s, "📉 持有的人：什麼價位減倉、什麼價位停損", s_stance, s_lines),
     ):
         with col, st.container(border=True):
             st.markdown(f"##### {title}")
             st.markdown(stance)
             st.markdown("\n".join(lines), unsafe_allow_html=True)
-            if sig_list:
-                st.markdown(f"**{sig_title}**\n" + _sig_price_lines(sig_list), unsafe_allow_html=True)
-
-    # 理由（依影響力大小排序）
-    st.markdown("**判斷理由**")
-    for pts, txt in sorted(reasons, key=lambda x: -abs(x[0])):
-        st.markdown(f"- {'🔴 ➕' if pts > 0 else '🟢 ➖'} `{pts:+d}`　{txt}")
+    st.caption("以上是依均線、近期高低點與波動算的參考，不保證會漲跌；買進後務必先設好停損。")
 
     # 回測：這檔股票過去同樣判斷，隔天實際表現
     stats = {"bull": [], "bear": []}
@@ -3446,11 +3435,6 @@ def _render_prediction(d, sigs, inst_table=None):
     )
 
 
-def _kline_start():
-    """按下「開始分析」（或在輸入框按 Enter）：等同於在「個股分析」搜尋，所有頁籤會一起切換到這檔股票。"""
-    request_search(st.session_state.get("kline_input", ""))
-
-
 def _kline_price_body(symbol, last_close, prev_bar_close):
     """K線分析頂端的價格：優先顯示即時現價（台股用證交所即時行情），取不到才退回最近一根K線的收盤價。"""
     try:
@@ -3475,17 +3459,6 @@ _kline_price_static = st.fragment(_kline_price_body)
 
 def render_kline_analysis():
     st.markdown("##### 📐 K線分析：用型態判斷進出場時機")
-    mobile_ = is_mobile()
-    c1, c2 = (st.container(), st.container()) if mobile_ else st.columns([3, 1], vertical_alignment="bottom")
-    with c1:
-        st.text_input(
-            "股票代號或中文名稱（搜尋後所有頁籤同步顯示這檔股票）",
-            key="kline_input",
-            on_change=_kline_start,  # 按 Enter 也會開始分析
-        )
-    with c2:
-        st.button("📐 開始分析", type="primary", key="kline_btn", on_click=_kline_start,
-                  width="stretch" if mobile_ else "content")
     range_label = st.radio("圖表區間", list(KLINE_RANGES), index=1, horizontal=True, key="kline_range")
 
     symbol, cur_name, failed = current_stock()
@@ -3493,10 +3466,10 @@ def render_kline_analysis():
         st.error(f"❌ 找不到「{failed}」的相關股票資料。請檢查輸入是否正確。")
         return
     if not symbol:
-        st.info("請輸入股票代號或名稱後按「開始分析」；搜尋結果會與「個股分析」、「K線分析2」同步。")
+        st.info("👆 請在最上方輸入股票代號或名稱，並按「開始搜尋並分析」。")
         return
 
-    with st.spinner("⏳ 載入資料中，請稍候…"):
+    with st.spinner("⏳ 分析中，請稍候…"):
         hist, valid = pd.DataFrame(), None
         for cand in [symbol] + ([symbol[:-3] + ".TWO"] if symbol.endswith(".TW") else []):
             try:
@@ -3575,7 +3548,7 @@ def render_kline_analysis():
 
     inst_table = None
     if valid.endswith((".TW", ".TWO")):
-        with st.spinner("⏳ 載入法人資料中，請稍候…"):
+        with st.spinner("⏳ 分析中（讀取法人資料），請稍候…"):
             try:
                 inst_table = fetch_institutional_official(valid, days=10)
             except Exception:
@@ -4118,108 +4091,93 @@ def _k2_range_txt(lo, hi):
 
 
 def _render_k2_price_blocks(df, clusters, period):
-    """K線分析2 的兩個價位區塊：想購買者的建議進場價、持有者的想退場價格。"""
+    """K線分析2 的兩個白話價位區塊：想買的人（進場價／停損價／獲利價）、持有的人（減倉價／停損價）。"""
     n = len(df)
     px = float(df["Close"].iloc[-1])
     recent = [cl for cl in clusters if cl["e"] >= n - 3]
     bull_hits = [m for cl in recent for m in cl["members"] if m["direction"] == "bull"]
     bear_hits = [m for cl in recent for m in cl["members"] if m["direction"] == "bear"]
 
-    # 通用價位：近 20 根的支撐／壓力，以及 ATR（用同一週期的K棒估算波動）
+    # 沒有型態時改用近 20 根的支撐／壓力；ATR 用同一週期的K棒估算波動，所以週、月、季K 會自動放大
     w = df.tail(20)
     sup, res = float(w["Low"].min()), float(w["High"].max())
     prev_c = df["Close"].shift(1)
     tr = pd.concat([df["High"] - df["Low"], (df["High"] - prev_c).abs(), (df["Low"] - prev_c).abs()], axis=1).max(axis=1)
     atr = float(tr.tail(14).mean())
-    ma5 = float(df["Close"].tail(5).mean())
+    pick = lambda hits: max(hits, key=lambda h: (h["g"], h["e"]))  # 取根數最多、最新的型態當依據
 
-    st.markdown(f"**📌 進出場價格參考**（以目前選擇的{period}K計算，現價＝最新一根{period}K收盤 {px:.2f}）")
+    st.markdown(f"**📌 進出場價格參考**（用{period}K計算，現價＝最新一根{period}K收盤 {px:.2f}）")
     col_b, col_s = st.columns(2)
 
+    # ---------------- 想買的人 ----------------
     with col_b, st.container(border=True):
-        st.markdown("##### 📈 想購買者：建議進場價")
+        st.markdown("##### 📈 想買的人：什麼價位進、什麼價位出")
+        others = ""
         if bull_hits:
-            for h in bull_hits:
-                lv = k2_hit_levels(df, h)
-                if px < lv["stop"]:
-                    status = "❌ 現價已跌破型態停損價，型態失效，暫不進場。"
-                elif lv["lo"] <= px <= lv["hi"]:
-                    status = "✅ 現價就在建議進場區內。"
-                elif px > lv["hi"]:
-                    status = "⏳ 現價高於進場區，不追高，等回測再進。"
-                else:
-                    status = "⏳ 現價低於進場區，等站回進場區再進。"
-                st.markdown(
-                    f"**▲ {h['name']}**（{_k2_fmt(df.index[h['e']], period)}）\n\n"
-                    f"- 建議進場價：{_k2_range_txt(lv['lo'], lv['hi'])}\n"
-                    f"- 停損價：跌破 {_pz(lv['stop'])} 型態失效\n"
-                    f"- {status}",
-                    unsafe_allow_html=True,
-                )
+            h = pick(bull_hits)
+            lv = k2_hit_levels(df, h)
+            lo, hi, stop = lv["lo"], lv["hi"], lv["stop"]
+            basis = f"▲ {h['name']}（{_k2_fmt(df.index[h['e']], period)}）"
+            others = "、".join(x["name"] for x in bull_hits if x is not h)
         else:
-            st.caption(f"最近 3 根{period}K 沒有偏多型態，以下為通用價位。")
-        if bear_hits:
-            st.warning("同時出現偏空型態：" + "、".join(h["name"] for h in bear_hits) + "，進場宜保守、縮小部位。")
+            lo, hi, stop = sup, sup + 0.5 * atr, sup - 0.5 * atr
+            basis = f"近 20 根的支撐位（最近 3 根{period}K 沒有偏多型態）"
+        tgt = res if res > hi + 0.5 * atr else hi + 2 * atr
+        st.caption("依據：" + basis + (f"；另有 {others}" if others else ""))
         st.markdown(
-            "**通用價位**（不依型態）\n"
-            f"- 🛡️ 回測支撐 {_k2_range_txt(sup, sup + 0.5 * atr)} 止穩再進場，停損 {_pz(sup - 0.5 * atr)}\n"
-            f"- 🚀 收盤站上壓力 {_pz(res)} 且量能放大再進場，進場區 {_k2_range_txt(res, res + 0.5 * atr)}，停損 {_pz(res - atr)}（跌回壓力下方視為突破失敗）",
+            f"- 🟢 **買進價**：{_k2_range_txt(lo, hi)}　股價回到這區再買，別追高\n"
+            f"- 🛑 **停損價**：{_pz(stop)}　跌破就賣，認賠不要拗\n"
+            f"- 🎯 **獲利價**：{_pz(tgt)}　漲到這附近可以先賣掉",
             unsafe_allow_html=True,
         )
+        if px < stop:
+            st.markdown(f"👉 現價 {px:.2f} 已經跌破停損價，**先不要買**。")
+        elif lo <= px <= hi and not bull_hits and px < float(df["Close"].tail(5).mean()):
+            st.markdown(f"👉 現價 {px:.2f} 雖在買進區，但**沒有止跌型態、趨勢偏弱，先觀望較安全**；真要買請小部位並設好停損。")
+        elif lo <= px <= hi:
+            st.markdown(f"👉 現價 {px:.2f} 已在買進區，**可以分批買**，記得設停損。")
+        elif px > hi:
+            st.markdown(f"👉 現價 {px:.2f} 還在買進價上方 {(px / hi - 1) * 100:.1f}%，**先等回檔，別追高**。")
+        else:
+            st.markdown(f"👉 現價 {px:.2f} 低於買進區，**等站回 {lo:.2f} 以上再買**。")
+        if bear_hits:
+            st.warning("同時有偏空型態（" + "、".join(h["name"] for h in bear_hits) + "），要買的話建議縮小部位。")
 
+    # ---------------- 持有的人 ----------------
     with col_s, st.container(border=True):
-        st.markdown("##### 📉 持有者：想退場價格")
+        st.markdown("##### 📉 持有的人：什麼價位減倉、什麼價位停損")
+        others = ""
         if bear_hits:
-            for h in bear_hits:
-                lv = k2_hit_levels(df, h)
-                if px < lv["stop"]:
-                    status = "⚠️ 現價已跌破出場價，已觸發出場；可等反彈到減碼區再賣，不宜再凹單。"
-                elif px < lv["lo"]:
-                    status = "⏳ 現價低於減碼區，反彈到減碼區逢高賣；跌破出場價就出場。"
-                elif px <= lv["hi"]:
-                    status = "⚠️ 現價就在減碼區內，可分批減碼。"
-                else:
-                    status = "⏳ 現價高於減碼區，型態轉弱尚未被價格確認，留意跌破出場價。"
-                st.markdown(
-                    f"**▼ {h['name']}**（{_k2_fmt(df.index[h['e']], period)}）\n\n"
-                    f"- 反彈減碼價：{_k2_range_txt(lv['lo'], lv['hi'])}\n"
-                    f"- 跌破出場價：{_pz(lv['stop'])}\n"
-                    f"- {status}",
-                    unsafe_allow_html=True,
-                )
+            h = pick(bear_hits)
+            lv = k2_hit_levels(df, h)
+            lo, hi, stop = lv["lo"], lv["hi"], lv["stop"]
+            basis = f"▼ {h['name']}（{_k2_fmt(df.index[h['e']], period)}）"
+            others = "、".join(x["name"] for x in bear_hits if x is not h)
         else:
-            st.caption(f"最近 3 根{period}K 沒有偏空型態，以下為通用價位。")
-        if bull_hits:
-            st.info("同時出現偏多型態：" + "、".join(h["name"] for h in bull_hits) + "，可考慮續抱，但仍要設好出場價。")
+            stop = sup
+            lo, hi = (px, sup) if px < sup else (res - 0.5 * atr, res)
+            basis = f"近 20 根的支撐與壓力（最近 3 根{period}K 沒有偏空型態）"
+        st.caption("依據：" + basis + (f"；另有 {others}" if others else ""))
         st.markdown(
-            "**通用價位**（不依型態）\n"
-            f"- 🛡️ 收盤跌破近 20 根支撐 {_pz(sup)} 就出場（若現價已低於此價，改看反彈到此價附近是否站得回）\n"
-            f"- 🎯 逼近壓力 {_k2_range_txt(res - 0.5 * atr, res)} 量縮不過，先減碼\n"
-            f"- 📉 收盤跌破 5 根均價 {_pz(ma5)}，先減碼保護獲利",
+            f"- 🟡 **減倉價**：{_k2_range_txt(lo, hi)}　漲（反彈）到這區，先賣一部分\n"
+            f"- 🛑 **停損價**：{_pz(stop)}　跌破就全部賣掉",
             unsafe_allow_html=True,
         )
-    st.caption("價位是依型態與近期高低點算出的參考，不是保證；進場後務必先設好停損，跌破就執行。")
-
-
-def _kline2_start():
-    """等同於在「個股分析」搜尋，所有頁籤會一起切換到這檔股票。"""
-    request_search(st.session_state.get("kline2_input", ""))
+        if px < stop:
+            st.markdown(f"👉 現價 {px:.2f} 已低於停損價，表示已轉弱。**有持股就趁反彈先出，不要硬等**。")
+        elif lo <= px <= hi:
+            st.markdown(f"👉 現價 {px:.2f} 已在減倉區，**可以先賣一部分**。")
+        elif px > hi:
+            st.markdown(f"👉 現價 {px:.2f} 高於減倉區，**先續抱**，跌破停損價再賣。")
+        else:
+            st.markdown(f"👉 現價 {px:.2f} 在停損價與減倉區之間，**守住 {stop:.2f} 就先觀察**。")
+        if bull_hits:
+            st.info("同時有偏多型態（" + "、".join(h["name"] for h in bull_hits) + "），可以續抱，但還是要設好停損價。")
+    st.caption("以上是依K線型態與近期高低點算的參考，不保證會漲跌；買進後務必先設好停損。")
 
 
 def render_kline_analysis2():
     st.markdown("##### 📐 K線分析2：18 種K線型態標註（參考處置王「K線技術分析教學」）")
-    mobile_ = is_mobile()
-    c1, c2 = (st.container(), st.container()) if mobile_ else st.columns([3, 1], vertical_alignment="bottom")
-    with c1:
-        st.text_input(
-            "股票代號或中文名稱（搜尋後所有頁籤同步顯示這檔股票）",
-            key="kline2_input",
-            on_change=_kline2_start,
-        )
-    with c2:
-        st.button("📐 開始分析", type="primary", key="kline2_btn", on_click=_kline2_start,
-                  width="stretch" if mobile_ else "content")
-
     period = st.radio("K線週期", ["日", "週", "月", "季"], horizontal=True, key="k2_period",
                       format_func=lambda p: f"{p}K")
     opts = K2_BARS[period]
@@ -4251,11 +4209,11 @@ def render_kline_analysis2():
         _render_k2_help()
         return
     if not symbol:
-        st.info("請輸入股票代號或名稱後按「開始分析」；搜尋結果會與「個股分析」、「K線分析」同步。")
+        st.info("👆 請在最上方輸入股票代號或名稱，並按「開始搜尋並分析」。")
         _render_k2_help()
         return
 
-    with st.spinner("⏳ 載入資料中，請稍候…"):
+    with st.spinner("⏳ 分析中，請稍候…"):
         hist, valid = pd.DataFrame(), None
         for cand in [symbol] + ([symbol[:-3] + ".TWO"] if symbol.endswith(".TW") else []):
             try:
@@ -4453,7 +4411,7 @@ def _render_k2_help():
 | 三內降 | 第 3 根收盤～第 2 根收盤 | 型態最低價 |
 
 只針對「最近 3 根K線內」出現的型態給價位；現價已經跌破停損（出場）價時，會直接標示型態失效或已觸發出場。
-通用價位：支撐＝近 20 根最低價、壓力＝近 20 根最高價、ATR＝近 14 根平均真實波幅；回測支撐進場區＝支撐～支撐＋0.5ATR，停損＝支撐－0.5ATR。
+通用價位（沒有型態時使用）：支撐＝近 20 根最低價、壓力＝近 20 根最高價、ATR＝近 14 根平均真實波幅。想買的人：買進價＝支撐～支撐＋0.5ATR、停損價＝支撐－0.5ATR；獲利價＝近 20 根最高價（若太近則取買進價上緣＋2ATR）。持有的人：減倉價＝壓力下方 0.5ATR～壓力（現價已跌破支撐時，改為現價～支撐的反彈區）、停損價＝支撐。
 
 **限制**：處置王只公開結構說明，沒有公開精確門檻（長短實體、影線、跳空、深入幅度等），本頁採用上列常見慣例。
 同一型態在不同看盤工具結果不同很正常，請以「條件比對」表確認每一項數值。
@@ -4464,28 +4422,43 @@ def _render_k2_help():
 # ---------------------------------------------------------------------------
 # 主畫面：輸入區
 # ---------------------------------------------------------------------------
+# 全站共用的搜尋列：放在所有頁籤上方，在哪個頁籤都能直接搜尋；
+# 搜尋後「個股分析」、「K線分析」、「K線分析2」會一起顯示同一檔股票。
+mobile = is_mobile()
+if mobile:
+    # 手機：輸入框與按鈕由上而下全寬排列
+    in_col = btn_col = st.container()
+else:
+    in_col, btn_col, _spacer = st.columns([3, 1.5, 5], vertical_alignment="bottom")
+with in_col:
+    st.text_input(
+        "請輸入股票代號或中文名稱：",
+        key="input_val",
+        on_change=handle_search_button_click,  # 按 Enter 也會開始搜尋
+    )
+with btn_col:
+    st.button(
+        "🔍 開始搜尋並分析",
+        type="primary",
+        on_click=handle_search_button_click,
+        width="stretch" if mobile else "content",
+    )
+
 tab_stock, tab_kline, tab_kline2, tab_rank, tab_inst = st.tabs(
     ["🔍 個股分析", "📐 K線分析", "📐 K線分析2", "🔥 即時市場排行", "🏦 前一交易日買超賣超"]
 )
 
+# K線頁籤先放「分析中」佔位：搜尋與載入期間畫面不會空白、也看得出有在動作；
+# 資料備妥後，下方再把佔位整塊換成真正內容。
+with tab_kline:
+    kline_slot = st.empty()
+with tab_kline2:
+    kline2_slot = st.empty()
+if st.session_state.pending_search or st.session_state.get("_k_done_for", "") != st.session_state.trigger_search:
+    kline_slot.info("⏳ 分析中，請稍候…")
+    kline2_slot.info("⏳ 分析中，請稍候…")
+
 with tab_stock:
-    mobile = is_mobile()
-    if mobile:
-        # 手機：輸入框與按鈕由上而下全寬排列
-        in_col = btn_col = st.container()
-    else:
-        in_col, btn_col, _spacer = st.columns([3, 1.5, 5], vertical_alignment="bottom")
-
-    with in_col:
-        st.text_input("請輸入股票代號或中文名稱：", key="input_val")
-    with btn_col:
-        st.button(
-            "🔍 開始搜尋並分析",
-            type="primary",
-            on_click=handle_search_button_click,
-            width="stretch" if mobile else "content",
-        )
-
     time_period = TIME_PERIOD  # 固定為近 1 年
 
 
@@ -4507,16 +4480,20 @@ with tab_stock:
     if pending:
         st.session_state.pending_search = ""
         with result_slot.container():
-            with st.spinner(f"⏳ 載入「{pending}」資料中，請稍候…"):
+            with st.spinner(f"⏳ 分析「{pending}」中，請稍候…"):
                 run_search(pending)
+            # 查詢完成後、結果畫出來之前，保留提示（結果區稍後會被整塊換成分析內容）
+            st.info("⏳ 分析中，請稍候…")
 
 # K線分析頁籤：放在搜尋處理之後、較慢的個股分析結果之前渲染。
 # 這樣不論是在哪個頁籤搜尋，這裡讀到的都是最新的「目前股票」，三個頁籤會同步顯示同一檔股票。
-with tab_kline:
+with kline_slot.container():
     render_kline_analysis()
 
-with tab_kline2:
+with kline2_slot.container():
     render_kline_analysis2()
+
+st.session_state["_k_done_for"] = st.session_state.trigger_search
 
 # ---------------------------------------------------------------------------
 # 側邊欄：搜尋紀錄
