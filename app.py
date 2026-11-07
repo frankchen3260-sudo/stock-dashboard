@@ -766,17 +766,24 @@ def fetch_institutional_official(symbol, days=10):
 
 
 # ---------------------------------------------------------------------------
-# 月K線趨勢分析（整理自網路上常見的月線技術分析經驗）
+# K線技術指標與趨勢分析（日K、月K共用同一套引擎）
+# 指標公式只在這裡定義一次：MA、KD(9,3,3)、MACD(12,26,9)、RSI(14)。
+# 趨勢判讀規則也只有一份（analyze_trend），日K與月K只是套用不同的參數表（_TREND_CFG）。
 # ---------------------------------------------------------------------------
-def add_monthly_indicators(m, windows=(5, 10, 20)):
-    """計算均線（預設 5/10/20）、KD (9,3,3)、MACD (12,26,9)。月K與日K共用。"""
-    m = m.copy()
-    for n in windows:
-        m[f"MA{n}"] = m["Close"].rolling(n).mean()
+def _rsi(close, n=14):
+    """RSI（Wilder 平滑）。完全沒有下跌時視為 100。"""
+    diff = close.diff()
+    gain = diff.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    loss = (-diff.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    rsi = 100 - 100 / (1 + gain / loss.replace(0, float("nan")))
+    return rsi.where(loss != 0, 100.0)
 
-    low9 = m["Low"].rolling(9).min()
-    high9 = m["High"].rolling(9).max()
-    rsv = (m["Close"] - low9) / (high9 - low9).replace(0, float("nan")) * 100
+
+def _kd(df, n=9):
+    """KD (9,3,3)：K、D 起始值 50，RSV 無法計算（資料不足）時為 NaN。回傳 (K, D) 兩個 Series。"""
+    low_n = df["Low"].rolling(n).min()
+    high_n = df["High"].rolling(n).max()
+    rsv = (df["Close"] - low_n) / (high_n - low_n).replace(0, float("nan")) * 100
     k_val, d_val, ks, ds = 50.0, 50.0, [], []
     for r in rsv:
         if pd.isna(r):
@@ -787,118 +794,241 @@ def add_monthly_indicators(m, windows=(5, 10, 20)):
         d_val = d_val * 2 / 3 + k_val / 3
         ks.append(k_val)
         ds.append(d_val)
-    m["K"], m["D"] = ks, ds
-
-    ema12 = m["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = m["Close"].ewm(span=26, adjust=False).mean()
-    m["DIF"] = ema12 - ema26
-    m["MACD"] = m["DIF"].ewm(span=9, adjust=False).mean()
-    m["OSC"] = m["DIF"] - m["MACD"]
-    return m
+    return pd.Series(ks, index=df.index), pd.Series(ds, index=df.index)
 
 
-def analyze_monthly_trend(m):
-    """回傳 (訊號列表, 總分, 判讀標籤, 提示等級)。每個訊號分數為 +1 / 0 / -1。"""
-    signals = []
-    last, prev = m.iloc[-1], m.iloc[-2]
+def _macd(close, fast=12, slow=26, signal=9):
+    """MACD：回傳 (DIF, MACD 訊號線, OSC 柱狀體) 三個 Series。"""
+    dif = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+    sig = dif.ewm(span=signal, adjust=False).mean()
+    return dif, sig, dif - sig
+
+
+def add_indicators(df, windows=(5, 10, 20), with_rsi=False):
+    """幫 K 線資料表加上 MA／K／D／DIF／MACD／OSC（with_rsi=True 時再加 RSI）。日K、月K共用。"""
+    d = df.copy()
+    for n in windows:
+        d[f"MA{n}"] = d["Close"].rolling(n).mean()
+    d["K"], d["D"] = _kd(d)
+    d["DIF"], d["MACD"], d["OSC"] = _macd(d["Close"])
+    if with_rsi:
+        d["RSI"] = _rsi(d["Close"])
+    return d
+
+
+def _recent_cross(series, tail):
+    """近 tail 筆內最近一次穿越零軸的方向：1＝由負（或零）轉正、-1＝由正（或零）轉負、0＝沒有穿越。
+    例：MA20 − MA60 的黃金／死亡交叉、K − D 的交叉、MACD 柱狀體翻紅／翻綠。"""
+    s = series.dropna().tail(tail)
+    if len(s) < 2:
+        return 0
+    sg = np.sign(s.to_numpy(float))
+    for x in range(len(sg) - 1, 0, -1):
+        if sg[x] > 0 and sg[x - 1] <= 0:
+            return 1
+        if sg[x] < 0 and sg[x - 1] >= 0:
+            return -1
+    return 0
+
+
+# 日K／月K的趨勢判讀參數（想調整規則或門檻，只要改這裡）
+_TREND_CFG = {
+    "月": dict(
+        mas=(5, 10, 20), ma_label="月均線", ma_names="5/10/20月",
+        arr_bull="月MA5 > MA10 > MA20，多頭排列", arr_bear="月MA5 < MA10 < MA20，空頭排列",
+        dirs=[(10, "月MA10 方向", "月MA10")],
+        k_title="近3月K棒", k_n=3,
+        k_bull=lambda r: "連續 3 根紅K，買盤延續" if r == 3 else None,
+        k_bear=lambda r: "連續 3 根黑K，賣壓沉重" if r == 0 else None,
+        k_mixed=lambda r: f"3 根中有 {r} 根紅K，多空拉鋸",
+        hl_up="近3月高點、低點逐月墊高", hl_down="近3月高點、低點逐月下移",
+        range_n=12, range_min=6, range_title="12月區間", range_unit="個月",
+        volume=False, rsi=False, kd_title="月KD", macd_title="月MACD", shape_title="最新月K型態",
+        cuts=(5, 2, -1, -4),  # 強勢多頭 / 偏多 / 盤整 / 偏空 的分數下限
+    ),
+    "日": dict(
+        mas=(5, 10, 20, 60), ma_label="均線", ma_names="5/10/20/60日",
+        arr_bull="短中長均線由上而下排列，多頭排列", arr_bear="短中長均線由下而上排列，空頭排列",
+        dirs=[(20, "月線方向", "月線 (MA20)"), (60, "季線方向", "季線 (MA60)")],
+        k_title="近5日K棒", k_n=5,
+        k_bull=lambda r: f"5 根中有 {r} 根紅K，買盤強勢" if r >= 4 else None,
+        k_bear=lambda r: f"5 根中僅 {r} 根紅K，賣壓偏重" if r <= 1 else None,
+        k_mixed=lambda r: f"5 根中有 {r} 根紅K，多空拉鋸",
+        hl_up="近3日高點、低點逐日墊高", hl_down="近3日高點、低點逐日下移",
+        range_n=20, range_min=10, range_title="20日區間", range_unit="日",
+        volume=True, rsi=True, kd_title="日KD", macd_title="日MACD", shape_title="最新日K型態",
+        cuts=(6, 3, -2, -5),
+    ),
+}
+
+
+def _trend_label(total, cuts):
+    strong, bull, flat, bear = cuts
+    if total >= strong:
+        return "強勢多頭", "success"
+    if total >= bull:
+        return "偏多", "success"
+    if total >= flat:
+        return "盤整觀望", "info"
+    if total >= bear:
+        return "偏空", "error"
+    return "空頭走勢", "error"
+
+
+def analyze_trend(d, tf):
+    """日K（tf='日'）、月K（tf='月'）共用的趨勢判讀。d 需先用 add_indicators 加好指標（日K要 with_rsi=True）。
+    回傳 (訊號列表, 總分, 判讀標籤, 提示等級)；每個訊號分數為 +1 / 0 / -1。"""
+    cfg = _TREND_CFG[tf]
+    sig = []
+    last, prev = d.iloc[-1], d.iloc[-2]
     close = last["Close"]
 
-    # 1. 股價相對月均線
-    mas = [(n, last[f"MA{n}"]) for n in (5, 10, 20) if not pd.isna(last[f"MA{n}"])]
+    def add(title, text, score):
+        sig.append((title, text, score))
+
+    # 1. 股價相對均線
+    mas = [(n, last[f"MA{n}"]) for n in cfg["mas"] if not pd.isna(last[f"MA{n}"])]
     if mas:
         above = sum(1 for _, v in mas if close > v)
         score = 1 if above == len(mas) else (-1 if above == 0 else 0)
-        signals.append(("股價與月均線", f"站上 {above}/{len(mas)} 條月均線 (5/10/20月)", score))
+        add(f"股價與{cfg['ma_label']}", f"站上 {above}/{len(mas)} 條{cfg['ma_label']} ({cfg['ma_names']})", score)
 
-    # 2. 均線排列
-    ma5, ma10, ma20 = last["MA5"], last["MA10"], last["MA20"]
-    if not (pd.isna(ma5) or pd.isna(ma10) or pd.isna(ma20)):
-        if ma5 > ma10 > ma20:
-            signals.append(("均線排列", "月MA5 > MA10 > MA20，多頭排列", 1))
-        elif ma5 < ma10 < ma20:
-            signals.append(("均線排列", "月MA5 < MA10 < MA20，空頭排列", -1))
+    # 2. 均線排列（前三條必備；第四條（季線）有資料才納入）
+    core = [last[f"MA{n}"] for n in cfg["mas"][:3]]
+    if not any(pd.isna(v) for v in core):
+        chain = core + [last[f"MA{n}"] for n in cfg["mas"][3:] if not pd.isna(last[f"MA{n}"])]
+        if all(a > b for a, b in zip(chain, chain[1:])):
+            add("均線排列", cfg["arr_bull"], 1)
+        elif all(a < b for a, b in zip(chain, chain[1:])):
+            add("均線排列", cfg["arr_bear"], -1)
         else:
-            signals.append(("均線排列", "均線糾結，方向未明", 0))
+            add("均線排列", "均線糾結，方向未明", 0)
 
-    # 3. 月MA10 方向（中期趨勢）
-    if not (pd.isna(last["MA10"]) or pd.isna(prev["MA10"])):
-        if last["MA10"] > prev["MA10"]:
-            signals.append(("月MA10 方向", "月MA10 上揚", 1))
-        elif last["MA10"] < prev["MA10"]:
-            signals.append(("月MA10 方向", "月MA10 下彎", -1))
-        else:
-            signals.append(("月MA10 方向", "月MA10 走平", 0))
+    # 3. 均線方向（月K：MA10；日K：月線 MA20、季線 MA60）
+    for n, title, name in cfg["dirs"]:
+        cur, pre = last[f"MA{n}"], prev[f"MA{n}"]
+        if not (pd.isna(cur) or pd.isna(pre)):
+            if cur > pre:
+                add(title, f"{name} 上揚", 1)
+            elif cur < pre:
+                add(title, f"{name} 下彎", -1)
+            else:
+                add(title, f"{name} 走平", 0)
 
-    # 4. 近三個月紅黑K
-    recent3 = m.tail(3)
-    reds = int((recent3["Close"] > recent3["Open"]).sum())
-    if reds == 3:
-        signals.append(("近3月K棒", "連續 3 根紅K，買盤延續", 1))
-    elif reds == 0:
-        signals.append(("近3月K棒", "連續 3 根黑K，賣壓沉重", -1))
+    # 4. 近幾根紅黑K
+    recent = d.tail(cfg["k_n"])
+    reds = int((recent["Close"] > recent["Open"]).sum())
+    if (txt := cfg["k_bull"](reds)):
+        add(cfg["k_title"], txt, 1)
+    elif (txt := cfg["k_bear"](reds)):
+        add(cfg["k_title"], txt, -1)
     else:
-        signals.append(("近3月K棒", f"3 根中有 {reds} 根紅K，多空拉鋸", 0))
+        add(cfg["k_title"], cfg["k_mixed"](reds), 0)
 
-    # 5. 高低點墊高 / 摜低
-    h3, l3 = recent3["High"], recent3["Low"]
+    # 5. 高低點墊高 / 摜低（近 3 根）
+    r3 = d.tail(3)
+    h3, l3 = r3["High"], r3["Low"]
     if h3.is_monotonic_increasing and l3.is_monotonic_increasing and h3.nunique() == 3:
-        signals.append(("高低點", "近3月高點、低點逐月墊高", 1))
+        add("高低點", cfg["hl_up"], 1)
     elif h3.is_monotonic_decreasing and l3.is_monotonic_decreasing and h3.nunique() == 3:
-        signals.append(("高低點", "近3月高點、低點逐月下移", -1))
+        add("高低點", cfg["hl_down"], -1)
     else:
-        signals.append(("高低點", "高低點無明顯墊高或下移", 0))
+        add("高低點", "高低點無明顯墊高或下移", 0)
 
-    # 6. 突破 / 跌破近 12 個月區間
-    prior12 = m.iloc[:-1].tail(12)
-    if len(prior12) >= 6:
-        if close > prior12["High"].max():
-            signals.append(("12月區間", "收盤突破前 12 個月高點", 1))
-        elif close < prior12["Low"].min():
-            signals.append(("12月區間", "收盤跌破前 12 個月低點", -1))
+    # 6. 突破 / 跌破前 N 根區間
+    rn, ru = cfg["range_n"], cfg["range_unit"]
+    prior = d.iloc[:-1].tail(rn)
+    if len(prior) >= cfg["range_min"]:
+        if close > prior["High"].max():
+            add(cfg["range_title"], f"收盤突破前 {rn} {ru}高點", 1)
+        elif close < prior["Low"].min():
+            add(cfg["range_title"], f"收盤跌破前 {rn} {ru}低點", -1)
         else:
-            signals.append(("12月區間", "仍在前 12 個月高低區間內", 0))
+            add(cfg["range_title"], f"仍在前 {rn} {ru}高低區間內", 0)
 
-    # 7. 月KD
+    # 7. 量價關係（只有日K；今日量 vs 前 5 日均量）
+    if cfg["volume"] and "Volume" in d.columns and len(d) >= 7:
+        vol_avg = d["Volume"].iloc[-6:-1].mean()
+        if vol_avg and vol_avg > 0 and last["Volume"] > 0:
+            ratio = last["Volume"] / vol_avg
+            chg = (close - prev["Close"]) / prev["Close"] * 100
+            if ratio >= 1.5 and chg > 0:
+                add("量價關係", f"價漲量增（量為前5日均量 {ratio:.1f} 倍）", 1)
+            elif ratio >= 1.5 and chg < 0:
+                add("量價關係", f"價跌量增（量為前5日均量 {ratio:.1f} 倍），賣壓放大", -1)
+            elif ratio <= 0.7 and chg > 0:
+                add("量價關係", f"價漲量縮（量為前5日均量 {ratio:.1f} 倍），追價力道不足", 0)
+            else:
+                add("量價關係", f"量能無明顯異常（前5日均量 {ratio:.1f} 倍）", 0)
+
+    # 8. KD
     if not (pd.isna(last["K"]) or pd.isna(last["D"])):
         zone = "（高檔 ≥80，留意鈍化或反轉）" if last["K"] >= 80 else ("（低檔 ≤20，留意超賣反彈）" if last["K"] <= 20 else "")
         if last["K"] > last["D"]:
-            signals.append(("月KD", f"K {last['K']:.0f} > D {last['D']:.0f}，偏多{zone}", 1))
+            add(cfg["kd_title"], f"K {last['K']:.0f} > D {last['D']:.0f}，偏多{zone}", 1)
         else:
-            signals.append(("月KD", f"K {last['K']:.0f} < D {last['D']:.0f}，偏空{zone}", -1))
+            add(cfg["kd_title"], f"K {last['K']:.0f} < D {last['D']:.0f}，偏空{zone}", -1)
 
-    # 8. 月MACD
+    # 9. MACD
     if not pd.isna(last["OSC"]):
         if last["DIF"] > 0 and last["OSC"] > 0:
-            signals.append(("月MACD", "DIF 在零軸上且柱狀體為正，多方控盤", 1))
+            add(cfg["macd_title"], "DIF 在零軸上且柱狀體為正，多方控盤", 1)
         elif last["DIF"] < 0 and last["OSC"] < 0:
-            signals.append(("月MACD", "DIF 在零軸下且柱狀體為負，空方控盤", -1))
+            add(cfg["macd_title"], "DIF 在零軸下且柱狀體為負，空方控盤", -1)
         else:
-            signals.append(("月MACD", "DIF 與柱狀體方向不一致，轉折觀察期", 0))
+            add(cfg["macd_title"], "DIF 與柱狀體方向不一致，轉折觀察期", 0)
 
-    # 9. 最新月K型態（上下影線）
+    # 10. RSI(14)（只有日K）
+    if cfg["rsi"] and not pd.isna(last["RSI"]):
+        rsi = last["RSI"]
+        note = "（超買 ≥70，留意回檔）" if rsi >= 70 else ("（超賣 ≤30，留意反彈）" if rsi <= 30 else "")
+        if rsi > 50:
+            add("RSI(14)", f"RSI {rsi:.0f} 在 50 之上，偏多{note}", 1)
+        elif rsi < 50:
+            add("RSI(14)", f"RSI {rsi:.0f} 在 50 之下，偏空{note}", -1)
+        else:
+            add("RSI(14)", "RSI 剛好 50，多空平衡", 0)
+
+    # 11. 最新一根K棒的上下影線
     rng = last["High"] - last["Low"]
     if rng > 0:
         upper = (last["High"] - max(last["Open"], last["Close"])) / rng
         lower = (min(last["Open"], last["Close"]) - last["Low"]) / rng
         if upper > 0.5:
-            signals.append(("最新月K型態", "長上影線，上檔賣壓重", -1))
+            add(cfg["shape_title"], "長上影線，上檔賣壓重", -1)
         elif lower > 0.5:
-            signals.append(("最新月K型態", "長下影線，下檔有支撐", 1))
+            add(cfg["shape_title"], "長下影線，下檔有支撐", 1)
         else:
-            signals.append(("最新月K型態", "無明顯長影線", 0))
+            add(cfg["shape_title"], "無明顯長影線", 0)
 
-    total = sum(sc for _, _, sc in signals)
-    if total >= 5:
-        label, level = "強勢多頭", "success"
-    elif total >= 2:
-        label, level = "偏多", "success"
-    elif total >= -1:
-        label, level = "盤整觀望", "info"
-    elif total >= -4:
-        label, level = "偏空", "error"
-    else:
-        label, level = "空頭走勢", "error"
-    return signals, total, label, level
+    total = sum(sc for _, _, sc in sig)
+    label, level = _trend_label(total, cfg["cuts"])
+    return sig, total, label, level
+
+
+def _render_trend_summary(tf, signals, total, label, level, metrics):
+    """日K／月K共用的畫面：綜合判讀 + 指標數字 + 訊號明細表。metrics 為 [(名稱, 值文字)]。"""
+    getattr(st, level)(f"🧭 {tf}K綜合判讀：**{label}**（多空分數 {total:+d}，共 {len(signals)} 項訊號）")
+    for col, (name, val) in zip(st.columns(len(metrics)), metrics):
+        col.metric(name, val)
+    icon = {1: "🔴 偏多", 0: "⚪ 中性", -1: "🟢 偏空"}  # 台股慣例：紅多綠空
+    st.dataframe(
+        pd.DataFrame({
+            "判斷項目": [n for n, _, _ in signals],
+            "現況": [t for _, t, _ in signals],
+            "訊號": [icon[sc] for _, _, sc in signals],
+        }),
+        hide_index=True,
+        width="stretch",
+    )
+
+
+def _fmt_num(v, nd=2):
+    return f"{v:.{nd}f}" if not pd.isna(v) else "N/A"
+
+
+def _fmt_kd(last):
+    return f"{last['K']:.0f} / {last['D']:.0f}" if not pd.isna(last["K"]) else "N/A"
 
 
 def render_monthly_analysis(monthly, display_name):
@@ -909,48 +1039,21 @@ def render_monthly_analysis(monthly, display_name):
         st.info("月K資料不足（少於 6 個月），無法進行月線趨勢分析。")
         return
 
-    m = add_monthly_indicators(monthly)
-    signals, total, label, level = analyze_monthly_trend(m)
-
-    getattr(st, level)(
-        f"🧭 月K綜合判讀：**{label}**（多空分數 {total:+d}，共 {len(signals)} 項訊號）"
-    )
+    m = add_indicators(monthly, windows=_TREND_CFG["月"]["mas"])
+    signals, total, label, level = analyze_trend(m, "月")
 
     last = m.iloc[-1]
-    c1, c2, c3, c4 = st.columns(4)
-    for col, n in zip((c1, c2, c3), (5, 10, 20)):
-        v = last[f"MA{n}"]
-        col.metric(f"月MA{n}", f"{v:.2f}" if not pd.isna(v) else "N/A")
-    c4.metric(
-        "月KD (K / D)",
-        f"{last['K']:.0f} / {last['D']:.0f}" if not pd.isna(last["K"]) else "N/A",
-    )
-
-    icon = {1: "🔴 偏多", 0: "⚪ 中性", -1: "🟢 偏空"}  # 台股慣例：紅多綠空
-    st.dataframe(
-        pd.DataFrame(
-            {
-                "判斷項目": [n for n, _, _ in signals],
-                "現況": [d for _, d, _ in signals],
-                "訊號": [icon[sc] for _, _, sc in signals],
-            }
-        ),
-        hide_index=True,
-        width="stretch",
+    _render_trend_summary(
+        "月", signals, total, label, level,
+        [(f"月MA{n}", _fmt_num(last[f"MA{n}"])) for n in (5, 10, 20)] + [("月KD (K / D)", _fmt_kd(last))],
     )
 
     view = m.tail(36)
     fig_m = go.Figure()
     fig_m.add_trace(
         go.Candlestick(
-            x=view.index,
-            open=view["Open"],
-            high=view["High"],
-            low=view["Low"],
-            close=view["Close"],
-            name="月K",
-            increasing_line_color="red",
-            decreasing_line_color="green",
+            x=view.index, open=view["Open"], high=view["High"], low=view["Low"], close=view["Close"],
+            name="月K", increasing_line_color="red", decreasing_line_color="green",
         )
     )
     for n in (5, 10, 20):
@@ -973,152 +1076,6 @@ def render_monthly_analysis(monthly, display_name):
     return signals, total
 
 
-# ---------------------------------------------------------------------------
-# 日K線趨勢分析
-# ---------------------------------------------------------------------------
-def analyze_daily_trend(d):
-    """回傳 (訊號列表, 總分, 判讀標籤, 提示等級)。每個訊號分數為 +1 / 0 / -1。"""
-    signals = []
-    last, prev = d.iloc[-1], d.iloc[-2]
-    close = last["Close"]
-
-    # 1. 股價相對 5/10/20/60 日均線
-    mas = [(n, last[f"MA{n}"]) for n in (5, 10, 20, 60) if not pd.isna(last[f"MA{n}"])]
-    if mas:
-        above = sum(1 for _, v in mas if close > v)
-        score = 1 if above == len(mas) else (-1 if above == 0 else 0)
-        signals.append(("股價與均線", f"站上 {above}/{len(mas)} 條均線 (5/10/20/60日)", score))
-
-    # 2. 均線排列
-    ma5, ma10, ma20, ma60 = (last[f"MA{n}"] for n in (5, 10, 20, 60))
-    if not (pd.isna(ma5) or pd.isna(ma10) or pd.isna(ma20)):
-        chain = [ma5, ma10, ma20] + ([] if pd.isna(ma60) else [ma60])
-        if all(a > b for a, b in zip(chain, chain[1:])):
-            signals.append(("均線排列", "短中長均線由上而下排列，多頭排列", 1))
-        elif all(a < b for a, b in zip(chain, chain[1:])):
-            signals.append(("均線排列", "短中長均線由下而上排列，空頭排列", -1))
-        else:
-            signals.append(("均線排列", "均線糾結，方向未明", 0))
-
-    # 3. 月線（20日）方向、4. 季線（60日）方向
-    for n, label in ((20, "月線"), (60, "季線")):
-        cur, pre = last[f"MA{n}"], prev[f"MA{n}"]
-        if not (pd.isna(cur) or pd.isna(pre)):
-            if cur > pre:
-                signals.append((f"{label}方向", f"{label} (MA{n}) 上揚", 1))
-            elif cur < pre:
-                signals.append((f"{label}方向", f"{label} (MA{n}) 下彎", -1))
-            else:
-                signals.append((f"{label}方向", f"{label} (MA{n}) 走平", 0))
-
-    # 5. 近 5 日紅黑K
-    recent5 = d.tail(5)
-    reds = int((recent5["Close"] > recent5["Open"]).sum())
-    if reds >= 4:
-        signals.append(("近5日K棒", f"5 根中有 {reds} 根紅K，買盤強勢", 1))
-    elif reds <= 1:
-        signals.append(("近5日K棒", f"5 根中僅 {reds} 根紅K，賣壓偏重", -1))
-    else:
-        signals.append(("近5日K棒", f"5 根中有 {reds} 根紅K，多空拉鋸", 0))
-
-    # 6. 高低點墊高 / 摜低（近 3 日）
-    r3 = d.tail(3)
-    if r3["High"].is_monotonic_increasing and r3["Low"].is_monotonic_increasing and r3["High"].nunique() == 3:
-        signals.append(("高低點", "近3日高點、低點逐日墊高", 1))
-    elif r3["High"].is_monotonic_decreasing and r3["Low"].is_monotonic_decreasing and r3["High"].nunique() == 3:
-        signals.append(("高低點", "近3日高點、低點逐日下移", -1))
-    else:
-        signals.append(("高低點", "高低點無明顯墊高或下移", 0))
-
-    # 7. 突破 / 跌破前 20 日區間
-    prior20 = d.iloc[:-1].tail(20)
-    if len(prior20) >= 10:
-        if close > prior20["High"].max():
-            signals.append(("20日區間", "收盤突破前 20 日高點", 1))
-        elif close < prior20["Low"].min():
-            signals.append(("20日區間", "收盤跌破前 20 日低點", -1))
-        else:
-            signals.append(("20日區間", "仍在前 20 日高低區間內", 0))
-
-    # 8. 量價關係（今日量 vs 前 5 日均量）
-    if "Volume" in d.columns and len(d) >= 7:
-        vol_avg = d["Volume"].iloc[-6:-1].mean()
-        if vol_avg and vol_avg > 0 and last["Volume"] > 0:
-            ratio = last["Volume"] / vol_avg
-            chg = (close - prev["Close"]) / prev["Close"] * 100
-            if ratio >= 1.5 and chg > 0:
-                signals.append(("量價關係", f"價漲量增（量為前5日均量 {ratio:.1f} 倍）", 1))
-            elif ratio >= 1.5 and chg < 0:
-                signals.append(("量價關係", f"價跌量增（量為前5日均量 {ratio:.1f} 倍），賣壓放大", -1))
-            elif ratio <= 0.7 and chg > 0:
-                signals.append(("量價關係", f"價漲量縮（量為前5日均量 {ratio:.1f} 倍），追價力道不足", 0))
-            else:
-                signals.append(("量價關係", f"量能無明顯異常（前5日均量 {ratio:.1f} 倍）", 0))
-
-    # 9. 日KD
-    if not (pd.isna(last["K"]) or pd.isna(last["D"])):
-        zone = "（高檔 ≥80，留意鈍化或反轉）" if last["K"] >= 80 else ("（低檔 ≤20，留意超賣反彈）" if last["K"] <= 20 else "")
-        if last["K"] > last["D"]:
-            signals.append(("日KD", f"K {last['K']:.0f} > D {last['D']:.0f}，偏多{zone}", 1))
-        else:
-            signals.append(("日KD", f"K {last['K']:.0f} < D {last['D']:.0f}，偏空{zone}", -1))
-
-    # 10. 日MACD
-    if not pd.isna(last["OSC"]):
-        if last["DIF"] > 0 and last["OSC"] > 0:
-            signals.append(("日MACD", "DIF 在零軸上且柱狀體為正，多方控盤", 1))
-        elif last["DIF"] < 0 and last["OSC"] < 0:
-            signals.append(("日MACD", "DIF 在零軸下且柱狀體為負，空方控盤", -1))
-        else:
-            signals.append(("日MACD", "DIF 與柱狀體方向不一致，轉折觀察期", 0))
-
-    # 11. RSI(14)
-    if not pd.isna(last["RSI"]):
-        rsi = last["RSI"]
-        note = "（超買 ≥70，留意回檔）" if rsi >= 70 else ("（超賣 ≤30，留意反彈）" if rsi <= 30 else "")
-        if rsi > 50:
-            signals.append(("RSI(14)", f"RSI {rsi:.0f} 在 50 之上，偏多{note}", 1))
-        elif rsi < 50:
-            signals.append(("RSI(14)", f"RSI {rsi:.0f} 在 50 之下，偏空{note}", -1))
-        else:
-            signals.append(("RSI(14)", "RSI 剛好 50，多空平衡", 0))
-
-    # 12. 最新日K型態
-    rng = last["High"] - last["Low"]
-    if rng > 0:
-        upper = (last["High"] - max(last["Open"], last["Close"])) / rng
-        lower = (min(last["Open"], last["Close"]) - last["Low"]) / rng
-        if upper > 0.5:
-            signals.append(("最新日K型態", "長上影線，上檔賣壓重", -1))
-        elif lower > 0.5:
-            signals.append(("最新日K型態", "長下影線，下檔有支撐", 1))
-        else:
-            signals.append(("最新日K型態", "無明顯長影線", 0))
-
-    total = sum(sc for _, _, sc in signals)
-    if total >= 6:
-        label, level = "強勢多頭", "success"
-    elif total >= 3:
-        label, level = "偏多", "success"
-    elif total >= -2:
-        label, level = "盤整觀望", "info"
-    elif total >= -5:
-        label, level = "偏空", "error"
-    else:
-        label, level = "空頭走勢", "error"
-    return signals, total, label, level
-
-
-def add_daily_indicators(daily):
-    d = add_monthly_indicators(daily, windows=(5, 10, 20, 60))
-    diff = d["Close"].diff()
-    gain = diff.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    loss = (-diff.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-    d["RSI"] = 100 - 100 / (1 + gain / loss.replace(0, float("nan")))
-    d["RSI"] = d["RSI"].where(loss != 0, 100.0)  # 完全沒下跌時 RSI = 100
-    return d
-
-
 def render_daily_analysis(symbol):
     st.divider()
     st.subheader("📈 日K線趨勢分析")
@@ -1133,35 +1090,15 @@ def render_daily_analysis(symbol):
         st.info("日K資料不足（少於 30 個交易日），無法進行日K趨勢分析。")
         return
 
-    d = add_daily_indicators(daily)
-    signals, total, label, level = analyze_daily_trend(d)
-
-    getattr(st, level)(
-        f"🧭 日K綜合判讀：**{label}**（多空分數 {total:+d}，共 {len(signals)} 項訊號）"
-    )
+    d = add_indicators(daily, windows=_TREND_CFG["日"]["mas"], with_rsi=True)
+    signals, total, label, level = analyze_trend(d, "日")
 
     last = d.iloc[-1]
-    cols = st.columns(5)
-    for col, n, name in zip(cols[:3], (5, 20, 60), ("週線 MA5", "月線 MA20", "季線 MA60")):
-        v = last[f"MA{n}"]
-        col.metric(name, f"{v:.2f}" if not pd.isna(v) else "N/A")
-    cols[3].metric(
-        "日KD (K / D)",
-        f"{last['K']:.0f} / {last['D']:.0f}" if not pd.isna(last["K"]) else "N/A",
-    )
-    cols[4].metric("RSI(14)", f"{last['RSI']:.0f}" if not pd.isna(last["RSI"]) else "N/A")
-
-    icon = {1: "🔴 偏多", 0: "⚪ 中性", -1: "🟢 偏空"}  # 台股慣例：紅多綠空
-    st.dataframe(
-        pd.DataFrame(
-            {
-                "判斷項目": [n for n, _, _ in signals],
-                "現況": [dt for _, dt, _ in signals],
-                "訊號": [icon[sc] for _, _, sc in signals],
-            }
-        ),
-        hide_index=True,
-        width="stretch",
+    _render_trend_summary(
+        "日", signals, total, label, level,
+        [("週線 MA5", _fmt_num(last["MA5"])), ("月線 MA20", _fmt_num(last["MA20"])),
+         ("季線 MA60", _fmt_num(last["MA60"])), ("日KD (K / D)", _fmt_kd(last)),
+         ("RSI(14)", _fmt_num(last["RSI"], 0))],
     )
     st.caption(
         "📌 最後一根為最新交易日資料，盤中尚未收盤時訊號可能隨收盤改變。"
@@ -1718,19 +1655,11 @@ def _technical_items(d):
             arr = "資料不足，無法判斷均線排列"
 
         # 近 5 個交易日內的 20MA / 60MA 交叉
-        cross = ""
-        diff = (ma20_s - ma60_s).dropna().tail(6)
-        if len(diff) >= 2:
-            sg = [1 if v > 0 else (-1 if v < 0 else 0) for v in diff]
-            for x in range(len(sg) - 1, 0, -1):
-                if sg[x] > 0 and sg[x - 1] <= 0:
-                    cross = "近期出現黃金交叉（20MA 由下往上突破 60MA）＝短期買盤力道超越長期平均，中長期波段極大機率即將啟動上漲"
-                    break
-                if sg[x] < 0 and sg[x - 1] >= 0:
-                    cross = "近期出現死亡交叉（20MA 由上往下跌破 60MA）＝短期持股成本快速跌破長期平均，多頭行情結束，可能迎來深度崩盤或回檔"
-                    break
-        if not cross:
-            cross = "近 5 日無 20MA／60MA 交叉"
+        cross = {
+            1: "近期出現黃金交叉（20MA 由下往上突破 60MA）＝短期買盤力道超越長期平均，中長期波段極大機率即將啟動上漲",
+            -1: "近期出現死亡交叉（20MA 由上往下跌破 60MA）＝短期持股成本快速跌破長期平均，多頭行情結束，可能迎來深度崩盤或回檔",
+            0: "近 5 日無 20MA／60MA 交叉",
+        }[_recent_cross(ma20_s - ma60_s, 6)]
 
         items.append((*names[0], bool(ok), f"{detail}｜{arr}｜{cross}", stds[0]))
 
@@ -1746,17 +1675,11 @@ def _technical_items(d):
         else:
             zone, logic = "多空平衡區（20～80）", "股價處於正常波動範圍，以順勢操作或參考交叉訊號為主"
 
-        kd_cross = ""
-        kd_diff = (d["K"] - d["D"]).dropna().tail(4)
-        if len(kd_diff) >= 2:
-            sg = [1 if v > 0 else (-1 if v < 0 else 0) for v in kd_diff]
-            for x in range(len(sg) - 1, 0, -1):
-                if sg[x] > 0 and sg[x - 1] <= 0:
-                    kd_cross = "｜近期 K 由下往上穿越 D（黃金交叉），短線買盤轉強"
-                    break
-                if sg[x] < 0 and sg[x - 1] >= 0:
-                    kd_cross = "｜近期 K 由上往下跌破 D（死亡交叉），短線賣壓轉強"
-                    break
+        kd_cross = {
+            1: "｜近期 K 由下往上穿越 D（黃金交叉），短線買盤轉強",
+            -1: "｜近期 K 由上往下跌破 D（死亡交叉），短線賣壓轉強",
+            0: "",
+        }[_recent_cross(d["K"] - d["D"], 4)]
         items.append((*names[1], bool(k > dd and k < 80),
                       f"K {k:.0f}／D {dd:.0f}｜{zone}：{logic}{kd_cross}", stds[1]))
 
@@ -1790,17 +1713,11 @@ def _technical_items(d):
             zone, logic = "快慢線在 0 軸附近（一上一下）", "多空轉換中，方向尚未明確"
 
         # 近 3 個交易日內柱狀體是否翻色（台股：正＝紅柱、負＝綠柱）
-        osc_recent = d["OSC"].dropna().tail(4)
-        flip = ""
-        if len(osc_recent) >= 2:
-            signs = [1 if v > 0 else (-1 if v < 0 else 0) for v in osc_recent]
-            for i in range(len(signs) - 1, 0, -1):
-                if signs[i] > 0 and signs[i - 1] <= 0:
-                    flip = "柱狀體由綠翻紅（由負變正）＝買方動能增強，下跌力道減弱、上漲動能開始爆發，屬波段轉好的起點"
-                    break
-                if signs[i] < 0 and signs[i - 1] >= 0:
-                    flip = "柱狀體由紅翻綠（由正變負）＝賣方壓力湧現，上漲力道竭盡、下跌動能開始增強，屬波段轉壞的起點"
-                    break
+        flip = {
+            1: "柱狀體由綠翻紅（由負變正）＝買方動能增強，下跌力道減弱、上漲動能開始爆發，屬波段轉好的起點",
+            -1: "柱狀體由紅翻綠（由正變負）＝賣方壓力湧現，上漲力道竭盡、下跌動能開始增強，屬波段轉壞的起點",
+            0: "",
+        }[_recent_cross(d["OSC"], 4)]
         hist = flip or f"柱狀體 {osc:+.2f}，{'紅柱延續' if osc > 0 else '綠柱延續'}，未見翻色"
         items.append((*names[3], bool(osc > 0),
                       f"DIF {dif:.2f}／MACD {sig:.2f}｜{zone}：{logic}｜{hist}", stds[3]))
@@ -3306,13 +3223,8 @@ PRED_THRESHOLD = 25
 
 def _prepare_indicators(d):
     c = d["Close"]
-    delta = c.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    d["RSI"] = (100 - 100 / (1 + rs)).fillna(100)
-    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
-    d["MACD_H"] = macd - macd.ewm(span=9, adjust=False).mean()
+    d["RSI"] = _rsi(c).fillna(100)  # 公式與日K趨勢分析共用同一份（_rsi）
+    d["MACD_H"] = _macd(c)[2]       # MACD 柱狀體（OSC）
     d["VR"] = d["Volume"] / d["Volume"].shift(1).rolling(5).mean()
     d["OBV"] = (np.sign(c.diff()).fillna(0) * d["Volume"]).cumsum()  # 能量潮：價漲加量、價跌減量
     return d
@@ -3493,8 +3405,17 @@ def _prediction_pack(d, sigs):
 K2_PAT_PTS, K2_PAT_CAP = 10, 15  # 18 種型態加減分：最近 3 根日K，每組偏多 +10／偏空 -10，合計上限 ±15（權重為經驗設定，未回測）
 
 
-def _k2_pattern_factor(d):
-    """把「K線型態」的 18 種型態訊號併入預測分數。回傳 (加減分, 型態說明文字, 日K資料, 型態群組)。"""
+# 「K線分析」的訊號與「18 型態」有 7 組是同一種型態（例如錘形線＝錘子線）。
+# 預測分數裡 K線訊號已經算過一次（權重較高），所以最近 3 根內 K線訊號已經出現的型態，18 型態這邊不再重複加減分。
+K2_SAME_AS_K1 = {
+    "錘子線": "錘形線", "吊人線": "上吊線／射擊之星", "射擊之星": "上吊線／射擊之星",
+    "多頭吞噬": "多頭吞噬", "空頭吞噬": "空頭吞噬", "晨星": "早晨之星", "黃昏之星": "黃昏之星",
+}
+
+
+def _k2_pattern_factor(d, sigs=None):
+    """把「K線型態」的 18 種型態訊號併入預測分數。回傳 (加減分, 型態說明文字, 日K資料, 型態群組)。
+    sigs 為 K線訊號清單；最近 3 根內已被 K線訊號計過分的同種型態，不重複計分。"""
     try:
         dd = k2_resample(d, "日")
         cl = k2_cluster(k2_detect_cached(dd, 5, "日", tuple(sorted(K2_DEFAULT_SELECTED))))
@@ -3502,10 +3423,16 @@ def _k2_pattern_factor(d):
         _note_err("_k2_pattern_factor", _exc)
         return 0, "", None, []
     recent = [c for c in cl if c["e"] >= len(dd) - 3]
-    nb = sum(1 for c in recent if c["primary"]["direction"] == "bull")
-    nr = sum(1 for c in recent if c["primary"]["direction"] == "bear")
+    k1_recent = {s["name"] for s in (sigs or []) if s["idx"] >= len(d) - 3}
+    counted = []  # 每組重疊型態取最主要、且沒被 K線訊號計過分的一個
+    for c in recent:
+        fresh = [m for m in c["members"] if K2_SAME_AS_K1.get(m["name"]) not in k1_recent]
+        if fresh:
+            counted.append(max(fresh, key=lambda m: (m["g"], -m["s"])))  # 與 k2_cluster 選主要型態的規則相同
+    nb = sum(1 for m in counted if m["direction"] == "bull")
+    nr = sum(1 for m in counted if m["direction"] == "bear")
     pts = max(-K2_PAT_CAP, min(K2_PAT_CAP, (nb - nr) * K2_PAT_PTS))
-    names = "、".join(("▲" if c["primary"]["direction"] == "bull" else "▼") + c["primary"]["name"] for c in recent)
+    names = "、".join(("▲" if m["direction"] == "bull" else "▼") + m["name"] for m in counted)
     return int(pts), names, dd, cl
 
 
@@ -3516,10 +3443,10 @@ def _render_prediction(d, sigs, inst_table=None):
     vol_lots = {ix.strftime("%Y-%m-%d"): float(v) / 1000 for ix, v in d["Volume"].items()}
     inst = _inst_score(inst_table, vol_lots)
     score, reasons = _score_at(A, by, i, inst)
-    pat_pts, pat_txt, k2_df, k2_cl = _k2_pattern_factor(d)  # 併入「K線型態」的 18 種型態判斷
+    pat_pts, pat_txt, k2_df, k2_cl = _k2_pattern_factor(d, sigs)  # 併入「K線型態」的 18 種型態判斷（已被K線訊號計過分的不重複）
     score = int(max(-100, min(100, score + pat_pts)))
     if pat_pts:
-        reasons.append((pat_pts, f"最近 3 根日K型態：{pat_txt}"))
+        reasons.append((pat_pts, f"最近 3 根日K其他型態（與K線訊號重複者不計）：{pat_txt}"))
 
     # 下一個交易日（只跳過週末，不含國定假日）
     nd = d.index[-1] + datetime.timedelta(days=1)
@@ -3565,8 +3492,8 @@ def _render_prediction(d, sigs, inst_table=None):
     f1.metric("技術面（均線／指標）", f"{k_pts:+d}")
     f2.metric("量價關係", f"{pv_pts:+d}")
     f3.metric("三大法人籌碼", f"{inst[0]:+d}" if inst[1] else "無資料")
-    f4.metric("K線型態（18 型態）", f"{pat_pts:+d}", help="最近 3 根日K有符合的型態：偏多加分、偏空減分，詳見下方「K線型態」區。")
-    st.caption("🕯️ 最近 3 根日K型態：" + (pat_txt or "沒有符合條件的型態"))
+    f4.metric("K線型態（18 型態）", f"{pat_pts:+d}", help="最近 3 根日K符合、且尚未被上方K線訊號計過分的型態：偏多加分、偏空減分，詳見下方「K線型態」區。")
+    st.caption("🕯️ 最近 3 根日K其他型態（與K線訊號同種者不重複計分）：" + (pat_txt or "沒有符合條件的型態"))
     if inst_table is not None and not inst_table.empty:
         if inst_table.index[-1] != d.index[-1].strftime("%Y-%m-%d"):
             st.caption(f"ℹ️ 法人資料最新為 {inst_table.index[-1]}（當日資料可能尚未公布），籌碼因子以此日為準。")
@@ -3838,11 +3765,11 @@ def render_kline_analysis():
             try:
                 inst_table = fetch_institutional_official(valid, days=10)
             except Exception as _exc:
-                _note_err("_names", _exc)
+                _note_err("render_kline_analysis.inst_official", _exc)
                 try:
                     inst_table = summarize_institutional(fetch_institutional_raw(valid.split(".")[0]), days=10)
                 except Exception as _exc:
-                    _note_err("_names", _exc)
+                    _note_err("render_kline_analysis.inst_finmind", _exc)
                     inst_table = None
     st.session_state["_k1_inst"] = (valid, inst_table)
     _render_prediction(d, sigs, inst_table)
@@ -5189,6 +5116,14 @@ def summarize_stock(symbol, hist):
         v = {"bull": 1, "bear": -1}.get(k1["verdict"], 0)
         votes.append(("K線分析", v))
         rows.append(("K線分析（均線、指標、量價、K線型態）", _VOTE_TXT[v], f"預測分數 {k1['score']:+d}"))
+
+    try:  # 與「個股分析」日K趨勢表同一套判讀（只顯示、不投票，避免日K被重複計票）
+        _d1 = fetch_history(symbol, "1y").dropna(subset=["Open", "High", "Low", "Close"])
+        if len(_d1) >= 30:
+            _sg, _tot, _lab, _ = analyze_trend(add_indicators(_d1, windows=_TREND_CFG["日"]["mas"], with_rsi=True), "日")
+            rows.append(("日K趨勢表（個股分析頁）", "—", f"{_lab}（多空分數 {_tot:+d}，共 {len(_sg)} 項訊號）"))
+    except Exception as _exc:
+        _note_err("summarize_stock.daily_trend", _exc)
 
     tr = {p: _period_trend(k2_resample(hist, p)) for p in ("日", "週", "月")}
     ok = {p: x for p, x in tr.items() if x is not None}
