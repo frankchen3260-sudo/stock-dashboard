@@ -1141,9 +1141,15 @@ def _score_parts(A, by, i, inst=None):
     return parts, reasons
 
 
+# 各因子群組的倍率（預設全部 1.0＝不調整）。用 tools/calibrate_weights.py 跑多檔多年資料後，
+# 把建議值貼在這裡：某因子沒有預測力就調成 0 或 0.5，不用去改 SCORE_W 裡的細部分數。
+SCORE_SCALE = {g: 1.0 for g in SCORE_GROUPS}
+
+
 def _total_score(parts):
     cap = SCORE_W["total_cap"]
-    return int(max(-cap, min(cap, sum(parts.values()))))
+    total = sum(v * SCORE_SCALE.get(g, 1.0) for g, v in parts.items())
+    return int(max(-cap, min(cap, round(total))))
 
 
 def _score_at(A, by, i, inst=None):

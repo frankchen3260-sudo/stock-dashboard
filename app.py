@@ -201,9 +201,23 @@ def candle_fig(df, title, name="K線", mas=(), xaxis_title="日期", yaxis_title
 # 資料抓取（加上快取，避免每次 rerun 都重打 API 被限流）
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_history(symbol, period):
-    """只抓日K價格（快）。"""
-    return yf.Ticker(symbol).history(period=period)
+def _fetch_history_cached(symbol, period, adjusted):
+    return yf.Ticker(symbol).history(period=period, auto_adjust=adjusted)
+
+
+def price_adjusted():
+    """目前的價格基準：True＝還原權息價（預設）、False＝實際成交價。由側邊欄開關決定。"""
+    try:
+        return bool(st.session_state.get("price_adjusted", True))
+    except Exception:
+        return True
+
+
+def fetch_history(symbol, period, adjusted=None):
+    """只抓日K價格（快）。adjusted=None 時依側邊欄「價位使用還原權息價」開關。
+    還原權息價：除息日不會有假跳空，型態與指標較準，但舊的K線價位會比當時實際成交價低（越久以前差越多）；
+    實際成交價：與券商看盤軟體一致，但除息日會出現假跳空，可能被誤判成型態。"""
+    return _fetch_history_cached(symbol, period, price_adjusted() if adjusted is None else adjusted)
 
 
 def _load_info(symbol):
@@ -2690,12 +2704,20 @@ def _detect_signals_cached(symbol, stamp, _df):
 
 def _bars_stamp(hist):
     last = hist.iloc[-1]
-    return (str(hist.index[-1]), len(hist), round(float(last["Close"]), 4), round(float(last.get("Volume", 0) or 0)))
+    return (str(hist.index[-1]), len(hist), round(float(last["Close"]), 4), round(float(last.get("Volume", 0) or 0)),
+            round(float(hist["Close"].iloc[0]), 4))  # 第一根收盤：還原／實際價兩種基準不同，切換開關時一定重算
 
 
 def render_kline_analysis():
     st.markdown("##### 📐 K線分析：用型態判斷進出場時機")
     range_label = st.radio("圖表區間", list(KLINE_RANGES), index=1, horizontal=True, key="kline_range")
+    st.caption(
+        "💱 價位基準：" + (
+            "還原權息價（歷史價位已扣除配息，可能比券商看盤的舊價位低，越久以前差越多；最新價不受影響）。"
+            if price_adjusted() else
+            "實際成交價（與券商一致；除息日會有假跳空，型態可能被誤判）。"
+        ) + " 可在側邊欄切換。"
+    )
     market_live = is_market_open()
     closed_only = True
     if market_live:
@@ -3282,7 +3304,7 @@ def render_kline_analysis2():
 
     # ---- 進出場價格參考：想購買者／持有者 ----
     full = k2_resample(hist, period, tail=None)
-    stats = k2_stats_cached(valid, period, n_trend, str(full.index[-1]), full) if on else {}
+    stats = k2_stats_cached(valid, period, n_trend, f"{full.index[-1]}|{price_adjusted()}", full) if on else {}
     if period == "日":
         st.info("📌 日K 的進出場價位已整合進上方「隔日進出場參考」，這裡不重複顯示；切換到週／月／季K 會顯示該週期的價位。")
     else:
@@ -3331,7 +3353,7 @@ def render_kline_analysis2():
         _render_k2_stats(stats, period)
         if selected:
             bt_trades, bt_sum = k2_backtest_cached(
-                valid, period, n_trend, tuple(sorted(selected)), str(full.index[-1]),
+                valid, period, n_trend, tuple(sorted(selected)), f"{full.index[-1]}|{price_adjusted()}",
                 FEE_DISCOUNT, full,
             )
             _render_k2_backtest(full, bt_trades, bt_sum, period)
@@ -3961,6 +3983,11 @@ with st.sidebar:
 
     _total, _today = visit_stats()
     st.markdown("---")
+    st.toggle(
+        "價位使用還原權息價", value=True, key="price_adjusted",
+        help="開啟（預設）：歷史價格已扣除配息，除息日不會有假跳空，型態與指標較準；但舊的價位會比當時實際成交價低，越久以前差越多。"
+             "關閉：用實際成交價，和券商看盤軟體一致，但除息日會出現假跳空，可能被誤判成型態。最新一天的價格兩種都一樣。",
+    )
     st.markdown(f"👀 **網站累積瀏覽次數：{_total:,} 次**")
     st.caption(f"今日 {_today:,} 次（每次開啟或重新整理網頁算 1 次）")
     st.caption("介面版本：v5（膠囊頁籤、按需載入、K線頁籤合併）")
