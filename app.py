@@ -19,6 +19,11 @@ import yfinance as yf
 
 # 純計算部分（指標、判讀、訊號、評分）放在 kline_core.py，可獨立測試
 from kline_core import (
+    MARKET_REGIME_TXT,
+    fund_beacon_items,
+    market_regime,
+    regime_conflict,
+    tech_beacon_items,
     INSTITUTION_GROUPS,
     K2_BT_MAX_HOLD,
     K2_HORIZONS,
@@ -271,20 +276,24 @@ def _load_monthly(symbol):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_fundamentals(symbol):
-    """基本面、股利、EPS、月K：用多執行緒同時抓，只跟股票代號有關。"""
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    """基本面、股利、EPS：用多執行緒同時抓，只跟股票代號有關。（月K已改由 K線分析頁籤用 fetch_monthly 另外抓）"""
+    with ThreadPoolExecutor(max_workers=4) as pool:
         f_info = pool.submit(_load_info, symbol)
         f_div = pool.submit(_load_dividends, symbol)
         f_split = pool.submit(_load_splits, symbol)
         f_eps = pool.submit(_load_eps_quarterly, symbol)
-        f_month = pool.submit(_load_monthly, symbol)
         return (
             f_info.result(),
             f_div.result(),
             f_split.result(),
             f_eps.result(),
-            f_month.result(),
         )
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_monthly(symbol):
+    """近 10 年月K（K線分析頁籤的月K趨勢用）。"""
+    return _load_monthly(symbol)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1147,64 +1156,23 @@ def render_live_quote(symbol):
 # ---------------------------------------------------------------------------
 # 購買指標燈號（放在結果最上方）：達到條件亮紅燈、未達到亮綠燈、資料不足亮白燈
 # ---------------------------------------------------------------------------
-def _beacon_items(pe_ratio, eps_last4, inst_table, daily_res, monthly_res):
-    """回傳 [(指標名稱, 狀態, 說明)]，狀態：True=達到、False=未達到、None=資料不足。"""
-    items = []
-
-    # 2. 連續四季 EPS 為正
-    if eps_last4 is not None and len(eps_last4) >= 4:
-        last4 = list(eps_last4.head(4).values)
-        ok = all(v > 0 for v in last4)
-        items.append(("連續四季 EPS 為正", ok, "近四季（新→舊）：" + "、".join(f"{v:.2f}" for v in last4)))
-    else:
-        items.append(("連續四季 EPS 為正", None, "取得的季度 EPS 不足四季"))
-
-    # 3~5. 外資、投信、自營商：各自連續買進兩天以上
-    for inst in ("外資", "投信", "自營商"):
-        name = f"{inst}連續買進 ≥ 2 天"
-        if inst_table is not None and len(inst_table) >= 2 and inst in inst_table.columns:
-            direction, count = _streak(inst_table[inst])
-            if direction > 0 and count >= 2:
-                items.append((name, True, f"已連續買超 {count} 天"))
-            elif direction > 0:
-                items.append((name, False, "最近一日買超，但尚未連續兩天"))
-            elif direction < 0:
-                items.append((name, False, f"已連續賣超 {count} 天"))
-            else:
-                items.append((name, False, "最近一日買賣持平"))
-        else:
-            items.append((name, None, "無法人資料"))
-
-    # 4 / 5. 日K、月K：偏多訊號數 > 偏空訊號數
-    for name, res in (("日K趨勢 偏多 > 偏空", daily_res), ("月K趨勢 偏多 > 偏空", monthly_res)):
-        if res is None:
-            items.append((name, None, "資料不足，無法判讀"))
-        else:
-            signals = res[0]
-            bull = sum(1 for _, _, sc in signals if sc > 0)
-            bear = sum(1 for _, _, sc in signals if sc < 0)
-            items.append((name, bull > bear, f"偏多 {bull} 項、偏空 {bear} 項"))
-
-    # 8. 近期突破 / 跌破月線（日K的 20 日均線）：站上月線亮紅燈、跌破月線亮綠燈
-    name = "近期突破／跌破月線"
-    items.append((name, *_ma20_cross_state(daily_res)))
-    return items
-
-
-def render_beacons(slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res, fund_items=None, tech_items=None):
-    # 全部燈號整合成同一份清單：(名稱, 狀態, 說明, 判斷標準)
-    items = [(n, ok, d, "") for n, ok, d in _beacon_items(pe_ratio, eps_last4, inst_table, daily_res, monthly_res)]
-    for n, abbr, ok, d, std in (fund_items or []) + (tech_items or []):
-        items.append((f"{n}（{abbr}）", ok, d, std))
+def _beacon_rows(base_items, extra_items=None):
+    """把燈號整理成 [(名稱, 狀態, 說明, 判斷標準)]。base_items 為 [(名稱, 狀態, 說明)]，extra_items 為 [(名稱, 簡稱, 狀態, 說明, 標準)]。"""
+    rows = [(n, ok, d, "") for n, ok, d in base_items]
+    for n, abbr, ok, d, std in (extra_items or []):
+        rows.append((f"{n}（{abbr}）", ok, d, std))
     # 統一轉成 Python 布林（numpy 的 True/False 用 `is True` 判斷會落空，導致統計漏算）
-    items = [(n, None if ok is None else bool(ok), d, std) for n, ok, d, std in items]
+    return [(n, None if ok is None else bool(ok), d, std) for n, ok, d, std in rows]
 
+
+def render_beacons(slot, title, items):
+    """畫出一組燈號。items 為 _beacon_rows 的結果；個股分析頁籤放基本面／籌碼，K線分析頁籤放技術面。"""
     red = sum(1 for _, ok, _, _ in items if ok is True)
     green = sum(1 for _, ok, _, _ in items if ok is False)
     white = sum(1 for _, ok, _, _ in items if ok is None)
 
     with slot.container():
-        st.markdown("##### 🚦 購買指標燈號")
+        st.markdown(f"##### {title}")
         st.markdown(
             f"🔴 紅燈 **{red}** 個　🟢 綠燈 **{green}** 個"
             + (f"　⚪ 資料不足 **{white}** 個" if white else "")
@@ -1703,7 +1671,7 @@ def render_analysis(symbol_upper, time_period):
     try:
         with st.spinner("⏳ 分析中，請稍候…"):
             df = fetch_history(symbol_upper, time_period)
-            info, dividends_series, splits_series, eps_quarterly, monthly_df = (
+            info, dividends_series, splits_series, eps_quarterly = (
                 fetch_fundamentals(symbol_upper)
             )
 
@@ -1805,7 +1773,7 @@ def render_analysis(symbol_upper, time_period):
         st.subheader(f"📊 {display_name} ({symbol_upper}) 分析結果")
         render_company_intro(symbol_upper, info, display_name)
         beacon_slot = st.empty()
-        beacon_slot.info("🚦 購買指標燈號計算中…")
+        beacon_slot.info("🚦 基本面／籌碼燈號計算中…")
         render_live_quote(symbol_upper)
         getattr(st, diag_level)(diagnostic_msg)
 
@@ -1869,17 +1837,15 @@ def render_analysis(symbol_upper, time_period):
             _note_err("render_analysis.csv", _exc)
 
         inst_table = render_institutional(symbol_upper)
-        daily_res = render_daily_analysis(symbol_upper)
-        monthly_res = render_monthly_analysis(monthly_df, display_name)
         try:
             fund_items = _fundamental_items(info, pe_ratio, eps_quarterly, dividends_series, latest_close)
-            tech_items = _technical_items(daily_res[2] if daily_res else None)
         except Exception as _exc:
             _note_err("render_analysis", _exc)
-            fund_items, tech_items = None, None
+            fund_items = None
         render_beacons(
-            beacon_slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res, fund_items, tech_items
+            beacon_slot, "🚦 基本面／籌碼燈號", _beacon_rows(fund_beacon_items(eps_last4, inst_table), fund_items)
         )
+        st.caption("📐 日K／月K趨勢與技術面燈號已移到「K線分析」頁籤，和型態訊號、預測放在一起看。")
         render_news(symbol_upper, display_name)
 
     except Exception as e:
@@ -2442,7 +2408,7 @@ def _k2_pattern_factor(d, sigs=None):
     return int(pts), names, dd, cl
 
 
-def _render_prediction(d, sigs, inst_table=None):
+def _render_prediction(d, sigs, inst_table=None, regime=None):
     d, A, by = _prediction_pack(d, sigs)
     n = len(d)
     i = n - 1
@@ -2469,6 +2435,9 @@ def _render_prediction(d, sigs, inst_table=None):
     else:
         st.info(f"⚪ {nd_txt}：多空訊號不明確，**建議觀望**")
         verdict = "neutral"
+    _warn = regime_conflict(verdict, regime)
+    if _warn:
+        (st.warning if _warn.startswith("⚠️") else st.caption)(_warn)
 
     close = float(A["Close"][i])
     sup = [v for v in (A["MA5"][i], A["MA10"][i], A["MA20"][i], A["Low"][i - 10:i].min()) if v < close]
@@ -2708,6 +2677,26 @@ def _bars_stamp(hist):
             round(float(hist["Close"].iloc[0]), 4))  # 第一根收盤：還原／實際價兩種基準不同，切換開關時一定重算
 
 
+def render_trend_section():
+    """K線分析頁籤的「趨勢判讀」區：日K趨勢、月K趨勢、技術面燈號（原本放在個股分析頁籤）。"""
+    symbol, cur_name, failed = current_stock()
+    if not symbol or failed:
+        return
+    try:
+        name = cur_name or resolve_display_name(symbol, "")
+        daily_res = render_daily_analysis(symbol)
+        monthly_res = render_monthly_analysis(fetch_monthly(symbol), name)
+        try:
+            tech_items = _technical_items(daily_res[2] if daily_res else None)
+        except Exception as _exc:
+            _note_err("render_trend_section", _exc)
+            tech_items = None
+        st.divider()
+        render_beacons(st.empty(), "🚦 技術面燈號", _beacon_rows(tech_beacon_items(daily_res, monthly_res), tech_items))
+    except Exception as e:
+        st.error(f"讀取趨勢資料發生錯誤: {e}")
+
+
 def render_kline_analysis():
     st.markdown("##### 📐 K線分析：用型態判斷進出場時機")
     range_label = st.radio("圖表區間", list(KLINE_RANGES), index=1, horizontal=True, key="kline_range")
@@ -2788,6 +2777,21 @@ def render_kline_analysis():
     if live_dropped:
         st.caption("⏱ 盤中：下方訊號與預測以前一根已收盤的日K為準，今天的K線收盤後才會納入（可用上方開關改回即時）。")
 
+    # --- 大盤環境（台股才有；個股訊號在大盤空頭時失敗率較高）---
+    regime = None
+    if is_tw_symbol(valid):
+        try:
+            regime = market_regime(_twii_close_series()[0])
+        except Exception as _exc:
+            _note_err("render_kline_analysis.regime", _exc)
+    if regime:
+        _icon, _label, _advice = MARKET_REGIME_TXT[regime["regime"]]
+        st.markdown(
+            f"🌐 **大盤環境：{_icon} {_label}**　加權指數 {regime['last']:,.0f}（{regime['detail']}）"
+            f"｜近 20 日 {regime['ret20'] * 100:+.1f}%，距近半年高點 {regime['from_high'] * 100:+.1f}%"
+        )
+        st.caption(_advice)
+
     # --- 目前判斷（看最近 3 個交易日的訊號）---
     recent = [s for s in sigs if s["idx"] >= n - 3]
     buys = [s for s in recent if s["kind"] == "entry"]
@@ -2833,7 +2837,7 @@ def render_kline_analysis():
                     _note_err("render_kline_analysis.inst_finmind", _exc)
                     inst_table = None
     st.session_state["_k1_inst"] = (valid, inst_table)
-    _render_prediction(d, sigs, inst_table)
+    _render_prediction(d, sigs, inst_table, regime)
 
     # --- K 線圖 + 訊號標記 ---
     start = max(0, n - window)
@@ -3723,11 +3727,11 @@ def summarize_stock(symbol, hist):
     if is_tw_symbol(symbol):
         try:
             idx, idx_day, idx_src = _twii_close_series()
-            ma20 = float(idx.tail(20).mean())
-            v = 1 if float(idx.iloc[-1]) > ma20 else -1
-            votes.append(("大盤", v))
-            rows.append(("大盤（加權指數）", _VOTE_TXT[v],
-                         f"{float(idx.iloc[-1]):,.0f}（{idx_day}，{idx_src}），{'站上' if v > 0 else '跌破'} 20 日均價 {ma20:,.0f}"))
+            rg = market_regime(idx)  # 與K線分析頁籤的「大盤環境」同一套：月線＋季線＋兩線排列
+            if rg:
+                votes.append(("大盤", rg["vote"]))
+                rows.append(("大盤（加權指數）", _VOTE_TXT[rg["vote"]],
+                             f"{rg['last']:,.0f}（{idx_day}，{idx_src}），{MARKET_REGIME_TXT[rg['regime']][1]}：{rg['detail']}"))
         except Exception as _exc:
             _note_err("summarize_stock", _exc)
             pass
@@ -3939,7 +3943,9 @@ with tab_stock:
 # 「K線分析」頁籤同時放兩塊內容：上半是進出場預測（均線、指標、量價），下半是 18 種K線型態標註
 with kline_slot.container(), _timed("K線分析"):
     render_kline_analysis()
-    if current_stock()[0]:  # 有股票才顯示型態區；沒有股票或查詢失敗時，上半已顯示提示，不重複
+    if current_stock()[0]:  # 有股票才顯示下面兩區；沒有股票或查詢失敗時，上半已顯示提示，不重複
+        with _timed("日月K趨勢與燈號"):
+            render_trend_section()
         st.divider()
         render_kline_analysis2()
 

@@ -1744,3 +1744,95 @@ def _period_trend(df):
     c = df["Close"]
     px, ma5, ma10 = float(c.iloc[-1]), float(c.tail(5).mean()), float(c.tail(10).mean())
     return 1 if px > ma5 > ma10 else -1 if px < ma5 < ma10 else 0
+
+
+# ---------------------------------------------------------------------------
+# 大盤環境（加權指數）：個股訊號在大盤空頭時失敗率較高，所以把大盤方向獨立判斷出來
+# ---------------------------------------------------------------------------
+MARKET_REGIME_TXT = {
+    "bull": ("🔴", "多頭", "大盤站穩月線與季線，個股的進場訊號相對可靠；仍要看個股自己的停損。"),
+    "bear": ("🟢", "空頭", "大盤在月線與季線之下，個股多方訊號容易失敗，建議降低部位、拉高進場標準，或等大盤止穩。"),
+    "mixed": ("⚪", "盤整／轉折", "大盤多空未明（站上其中一條均線或均線糾結），個股訊號的可信度打折，進場宜保守、停損要設好。"),
+}
+
+
+def market_regime(close):
+    """用加權指數收盤序列（舊→新）判斷大盤環境。資料少於 60 筆回傳 None。
+    多頭：收盤在月線（20 日均價）與季線（60 日均價）之上，且月線 > 季線；
+    空頭：收盤在兩條之下，且月線 < 季線；其餘為盤整／轉折。
+    回傳 dict：regime(bull/bear/mixed)、vote(+1/-1/0)、last、ma20、ma60、ret20（近 20 日報酬）、from_high（距近半年高點）、detail（文字）。"""
+    c = pd.Series(close).dropna().astype(float)
+    if len(c) < 60:
+        return None
+    last = float(c.iloc[-1])
+    ma20, ma60 = float(c.tail(20).mean()), float(c.tail(60).mean())
+    a20, a60 = last > ma20, last > ma60
+    if a20 and a60 and ma20 > ma60:
+        regime = "bull"
+    elif (not a20) and (not a60) and ma20 < ma60:
+        regime = "bear"
+    else:
+        regime = "mixed"
+    ret20 = last / float(c.iloc[-21]) - 1 if len(c) > 21 else float("nan")
+    from_high = last / float(c.tail(120).max()) - 1
+    detail = (f"{'站上' if a20 else '跌破'}月線 {ma20:,.0f}、{'站上' if a60 else '跌破'}季線 {ma60:,.0f}，"
+              f"月線{'在' if ma20 > ma60 else '低於'}季線{'之上' if ma20 > ma60 else ''}")
+    return dict(regime=regime, vote={"bull": 1, "bear": -1, "mixed": 0}[regime], last=last, ma20=ma20, ma60=ma60,
+                ret20=ret20, from_high=from_high, detail=detail)
+
+
+def regime_conflict(verdict, regime):
+    """個股預測（bull/bear/neutral）與大盤環境衝突時回傳提醒文字，否則回傳空字串。"""
+    if not regime:
+        return ""
+    if verdict == "bull" and regime["regime"] == "bear":
+        return "⚠️ 預測偏多，但大盤目前是空頭環境：逆勢做多的失敗率較高，建議減碼或等大盤止穩再進場。"
+    if verdict == "bull" and regime["regime"] == "mixed":
+        return "ℹ️ 預測偏多，但大盤多空未明：可以進場，但部位宜保守、停損要設好。"
+    if verdict == "bear" and regime["regime"] == "bull":
+        return "ℹ️ 預測偏空，但大盤目前是多頭環境：個股轉弱時仍要出場，但可留意是否只是短線回檔。"
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# 購買指標燈號：基本面／籌碼 與 技術面 分開（技術面放在 K線分析頁籤）
+# ---------------------------------------------------------------------------
+def fund_beacon_items(eps_last4, inst_table):
+    """基本面／籌碼燈號：[(指標名稱, 狀態, 說明)]，狀態 True=達到、False=未達到、None=資料不足。"""
+    items = []
+    if eps_last4 is not None and len(eps_last4) >= 4:
+        last4 = list(eps_last4.head(4).values)
+        ok = all(v > 0 for v in last4)
+        items.append(("連續四季 EPS 為正", ok, "近四季（新→舊）：" + "、".join(f"{v:.2f}" for v in last4)))
+    else:
+        items.append(("連續四季 EPS 為正", None, "取得的季度 EPS 不足四季"))
+    for inst in ("外資", "投信", "自營商"):
+        name = f"{inst}連續買進 ≥ 2 天"
+        if inst_table is not None and len(inst_table) >= 2 and inst in inst_table.columns:
+            direction, count = _streak(inst_table[inst])
+            if direction > 0 and count >= 2:
+                items.append((name, True, f"已連續買超 {count} 天"))
+            elif direction > 0:
+                items.append((name, False, "最近一日買超，但尚未連續兩天"))
+            elif direction < 0:
+                items.append((name, False, f"已連續賣超 {count} 天"))
+            else:
+                items.append((name, False, "最近一日買賣持平"))
+        else:
+            items.append((name, None, "無法人資料"))
+    return items
+
+
+def tech_beacon_items(daily_res, monthly_res):
+    """技術面燈號：日K／月K 趨勢偏多是否多於偏空，以及近期突破／跌破月線。"""
+    items = []
+    for name, res in (("日K趨勢 偏多 > 偏空", daily_res), ("月K趨勢 偏多 > 偏空", monthly_res)):
+        if res is None:
+            items.append((name, None, "資料不足，無法判讀"))
+        else:
+            signals = res[0]
+            bull = sum(1 for _, _, sc in signals if sc > 0)
+            bear = sum(1 for _, _, sc in signals if sc < 0)
+            items.append((name, bull > bear, f"偏多 {bull} 項、偏空 {bear} 項"))
+    items.append(("近期突破／跌破月線", *_ma20_cross_state(daily_res)))
+    return items
