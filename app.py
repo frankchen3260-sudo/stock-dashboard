@@ -19,7 +19,12 @@ import yfinance as yf
 
 # 純計算部分（指標、判讀、訊號、評分）放在 kline_core.py，可獨立測試
 from kline_core import (
+    LEVEL_TONE,
     MARKET_REGIME_TXT,
+    _trend_label,
+    directional_alignment,
+    tone_html,
+    trend_vote,
     fund_beacon_items,
     market_regime,
     regime_conflict,
@@ -163,6 +168,12 @@ def is_mobile():
         _note_err("is_mobile", _exc)
         return False
     return "Mobile" in ua or "iPhone" in ua
+
+
+def tone_box(tone, msg):
+    """偏多（紅）／偏空（綠）／中性（藍）的提示色塊，台股慣例紅漲綠跌。
+    tone 可傳 bull／bear／neutral，也可傳舊的 success／error／info（success＝偏多、error＝偏空）。真正的錯誤與警告仍用 st.error／st.warning。"""
+    st.markdown(tone_html(LEVEL_TONE.get(tone, tone), msg), unsafe_allow_html=True)
 
 
 def show_chart(fig, height=None):
@@ -540,7 +551,7 @@ def render_institutional(symbol):
         return
 
     judge_df, overall_msg, overall_level = judge_institutional(table)
-    getattr(st, overall_level)(f"🧭 法人判讀：{overall_msg}")
+    tone_box(overall_level, f"🧭 法人判讀：{overall_msg}")
 
     # --- 10 日合計指標 ---
     cols = st.columns(4)
@@ -776,7 +787,7 @@ def fetch_institutional_official(symbol, days=10):
 
 def _render_trend_summary(tf, signals, total, label, level, metrics):
     """日K／月K共用的畫面：綜合判讀 + 指標數字 + 訊號明細表。metrics 為 [(名稱, 值文字)]。"""
-    getattr(st, level)(f"🧭 {tf}K綜合判讀：**{label}**（多空分數 {total:+d}，共 {len(signals)} 項訊號）")
+    tone_box(level, f"🧭 {tf}K綜合判讀：**{label}**（多空分數 {total:+d}，共 {len(signals)} 項訊號）")
     for col, (name, val) in zip(st.columns(len(metrics)), metrics):
         col.metric(name, val)
     icon = {1: "🔴 偏多", 0: "⚪ 中性", -1: "🟢 偏空"}  # 台股慣例：紅多綠空
@@ -1775,7 +1786,7 @@ def render_analysis(symbol_upper, time_period):
         beacon_slot = st.empty()
         beacon_slot.info("🚦 基本面／籌碼燈號計算中…")
         render_live_quote(symbol_upper)
-        getattr(st, diag_level)(diagnostic_msg)
+        tone_box(diag_level, diagnostic_msg)
 
         # 第一列：價格相關
         r1c1, r1c2, r1c3, r1c4 = st.columns(4)
@@ -2427,13 +2438,13 @@ def _render_prediction(d, sigs, inst_table=None, regime=None):
     st.markdown("##### 🔮 下個交易日預測")
     strength = "強烈" if abs(score) >= 50 else "偏"
     if score >= PRED_THRESHOLD:
-        st.success(f"🔼 {nd_txt}：{strength}多，**適合進場**（已持有者可續抱）")
+        tone_box("bull", f"🔼 {nd_txt}：{strength}多，**適合進場**（已持有者可續抱）")
         verdict = "bull"
     elif score <= -PRED_THRESHOLD:
-        st.error(f"🔽 {nd_txt}：{strength}空，**適合出場／減碼**（空手者不宜進場）")
+        tone_box("bear", f"🔽 {nd_txt}：{strength}空，**適合出場／減碼**（空手者不宜進場）")
         verdict = "bear"
     else:
-        st.info(f"⚪ {nd_txt}：多空訊號不明確，**建議觀望**")
+        tone_box("neutral", f"⚪ {nd_txt}：多空訊號不明確，**建議觀望**")
         verdict = "neutral"
     _warn = regime_conflict(verdict, regime)
     if _warn:
@@ -2571,6 +2582,14 @@ def _render_prediction(d, sigs, inst_table=None, regime=None):
             f"- 🧱 下檔大量支撐區 {_pz_range(px2(zlo), px2(zhi))}：收盤跌破 {_pz(px2(zlo * ZONE_BREAK_PCT))} 代表支撐失效，必須停損"
         )
 
+    if verdict == "bull":
+        _plan = f"買進價 {b_lo:.2f}～{b_hi:.2f}　停損 {b_stop:.2f}　獲利 {b_tgt:.2f}"
+    elif verdict == "bear":
+        _plan = f"先不要買；持股者減倉區 {s_lo:.2f}～{s_hi:.2f}　停損 {px2(support):.2f}"
+    else:
+        _plan = f"先觀望；收盤站上 {b_lo:.2f} 且量放大才考慮買　停損 {b_stop:.2f}"
+    _card_put(verdict=verdict, score=int(score), plan=_plan)
+
     # 放在頁籤上方、綜合判斷卡的下方（entry_slot 在主畫面建立），不論切到哪個頁籤都看得到
     with entry_slot.container():
         st.markdown("**📌 隔日進出場參考**")
@@ -2677,6 +2696,59 @@ def _bars_stamp(hist):
             round(float(hist["Close"].iloc[0]), 4))  # 第一根收盤：還原／實際價兩種基準不同，切換開關時一定重算
 
 
+def _card_put(**kw):
+    """各區塊把結論所需的數字放進來，最後由 render_conclusion_card 統一畫在K線分析頁籤最上方。"""
+    try:
+        st.session_state.setdefault("_k_card", {}).update(kw)
+    except Exception as _exc:
+        _note_err("_card_put", _exc)
+
+
+def render_conclusion_card(slot):
+    """K線分析頁籤最上方的結論卡：日K／月K趨勢、下個交易日預測、大盤環境、近 3 日訊號一眼看完，並判斷各項是否同向。"""
+    c = st.session_state.get("_k_card") or {}
+    if not (c.get("verdict") or c.get("daily")):
+        slot.empty()
+        return
+    d_lab, d_sc = c.get("daily") or (None, None)
+    m_lab, m_sc = c.get("monthly") or (None, None)
+    verdict = c.get("verdict")
+    rg = c.get("regime")
+    v_vote = {"bull": 1, "bear": -1, "neutral": 0}.get(verdict)
+    buys, sells = c.get("buys", 0), c.get("sells", 0)
+    sig_vote = 1 if buys and not sells else (-1 if sells and not buys else 0)
+    votes = [
+        ("日K趨勢", trend_vote(d_lab) if d_lab else None), ("月K趨勢", trend_vote(m_lab) if m_lab else None),
+        ("預測", v_vote), ("大盤", rg["vote"] if rg else None),
+    ]
+    tone, msg = directional_alignment(votes)
+    color = {1: "red", -1: "green", 0: "gray"}  # 台股：紅＝偏多、綠＝偏空
+
+    def cell(col, title, text, vote, sub=""):
+        col.caption(title)
+        col.markdown(f":{color[vote]}[**{text}**]" if (text and vote is not None) else "**—**")
+        if sub:
+            col.caption(sub)
+
+    with slot.container(border=True):
+        st.markdown(f"#### 🎯 K線結論：{c.get('name') or c.get('symbol') or ''}")
+        cols = st.columns(5)
+        cell(cols[0], "日K趨勢", d_lab, trend_vote(d_lab) if d_lab else None, f"多空分數 {d_sc:+d}" if d_lab else "")
+        cell(cols[1], "月K趨勢", m_lab, trend_vote(m_lab) if m_lab else None, f"多空分數 {m_sc:+d}" if m_lab else "")
+        cell(cols[2], "下個交易日預測", {"bull": "偏多", "bear": "偏空", "neutral": "觀望"}.get(verdict), v_vote,
+             f"預測分數 {c['score']:+d}" if "score" in c else "")
+        cell(cols[3], "大盤環境", MARKET_REGIME_TXT[rg["regime"]][1] if rg else None, rg["vote"] if rg else None,
+             f"加權 {rg['last']:,.0f}" if rg else "")
+        cell(cols[4], "近 3 日K線訊號", f"進場 {buys}／出場 {sells}" if (buys or sells) else "無新訊號", sig_vote)
+        tone_box(tone, msg)
+        if c.get("plan"):
+            st.caption(f"📌 {c['plan']}")
+        st.caption(
+            f"資料截至 {c.get('date', '')}。完整價位與理由見頁面最上方「📌 隔日進出場參考」，以及下方預測與趨勢判讀。"
+            "以上為規則式判斷，不是投資建議。"
+        )
+
+
 def render_trend_section():
     """K線分析頁籤的「趨勢判讀」區：日K趨勢、月K趨勢、技術面燈號（原本放在個股分析頁籤）。"""
     symbol, cur_name, failed = current_stock()
@@ -2686,6 +2758,10 @@ def render_trend_section():
         name = cur_name or resolve_display_name(symbol, "")
         daily_res = render_daily_analysis(symbol)
         monthly_res = render_monthly_analysis(fetch_monthly(symbol), name)
+        if daily_res:
+            _card_put(daily=(_trend_label(daily_res[1], _TREND_CFG["日"]["cuts"])[0], daily_res[1]))
+        if monthly_res:
+            _card_put(monthly=(_trend_label(monthly_res[1], _TREND_CFG["月"]["cuts"])[0], monthly_res[1]))
         try:
             tech_items = _technical_items(daily_res[2] if daily_res else None)
         except Exception as _exc:
@@ -2784,6 +2860,7 @@ def render_kline_analysis():
             regime = market_regime(_twii_close_series()[0])
         except Exception as _exc:
             _note_err("render_kline_analysis.regime", _exc)
+    _card_put(name=name, symbol=valid, regime=regime, date=d.index[-1].strftime("%Y-%m-%d"))
     if regime:
         _icon, _label, _advice = MARKET_REGIME_TXT[regime["regime"]]
         st.markdown(
@@ -2796,6 +2873,7 @@ def render_kline_analysis():
     recent = [s for s in sigs if s["idx"] >= n - 3]
     buys = [s for s in recent if s["kind"] == "entry"]
     sells = [s for s in recent if s["kind"] == "exit"]
+    _card_put(buys=len(buys), sells=len(sells))
 
     def _names(lst):
         return "、".join(f"{s['name']}（{s['date'].strftime('%m/%d')}）" for s in lst)
@@ -2808,13 +2886,15 @@ def render_kline_analysis():
             "方向不明，建議觀望，等下一根K線確認。"
         )
     elif sells:
-        st.error(
+        tone_box(
+            "bear",
             f"⚠️ 最近 3 個交易日出現出場／減碼訊號：{_names(sells)}。"
-            "持股者可考慮減碼或獲利了結，並嚴守停損紀律。"
+            "持股者可考慮減碼或獲利了結，並嚴守停損紀律。",
         )
     elif buys:
-        st.success(
-            f"🔔 最近 3 個交易日出現進場訊號：{_names(buys)}。建議等確認後分批進場。"
+        tone_box(
+            "bull",
+            f"🔔 最近 3 個交易日出現進場訊號：{_names(buys)}。建議等確認後分批進場。",
         )
     else:
         tips = {
@@ -3761,9 +3841,9 @@ def render_summary_card():
         for level, msg in fetch_events(symbol):
             {"error": st.error, "warning": st.warning}.get(level, st.info)(msg)
         if bulls and not bears and len(bulls) >= 2:
-            st.success(f"🔼 各項判斷一致偏多（{'、'.join(bulls)}）：可以考慮分批進場，仍要依下方價位設停損。")
+            tone_box("bull", f"🔼 各項判斷一致偏多（{'、'.join(bulls)}）：可以考慮分批進場，仍要依下方價位設停損。")
         elif bears and not bulls and len(bears) >= 2:
-            st.error(f"🔽 各項判斷一致偏空（{'、'.join(bears)}）：空手先不要買，有持股建議減倉。")
+            tone_box("bear", f"🔽 各項判斷一致偏空（{'、'.join(bears)}）：空手先不要買，有持股建議減倉。")
         elif bulls and bears:
             st.warning(f"⚖️ 判斷分歧：偏多的有「{'、'.join(bulls)}」，偏空的有「{'、'.join(bears)}」。"
                        "建議觀望，或縮小部位並嚴守停損。")
@@ -3942,12 +4022,15 @@ with tab_stock:
 # 這樣不論是在哪個頁籤搜尋，這裡讀到的都是最新的「目前股票」，各頁籤會同步顯示同一檔股票。
 # 「K線分析」頁籤同時放兩塊內容：上半是進出場預測（均線、指標、量價），下半是 18 種K線型態標註
 with kline_slot.container(), _timed("K線分析"):
+    st.session_state["_k_card"] = {}
+    card_slot = st.empty()  # 結論卡放最上面，等下面各區算完再填入
     render_kline_analysis()
     if current_stock()[0]:  # 有股票才顯示下面兩區；沒有股票或查詢失敗時，上半已顯示提示，不重複
         with _timed("日月K趨勢與燈號"):
             render_trend_section()
         st.divider()
         render_kline_analysis2()
+    render_conclusion_card(card_slot)
 
 st.session_state["_k_done_for"] = st.session_state.trigger_search
 

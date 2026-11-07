@@ -5,6 +5,8 @@ app.py 負責畫面與資料抓取；這裡只放可以單獨測試的部分：
 測試：python tests/test_kline_core.py
 """
 import datetime
+import re
+from html import escape as _html_escape
 
 import numpy as np
 import pandas as pd
@@ -1836,3 +1838,42 @@ def tech_beacon_items(daily_res, monthly_res):
             items.append((name, bull > bear, f"偏多 {bull} 項、偏空 {bear} 項"))
     items.append(("近期突破／跌破月線", *_ma20_cross_state(daily_res)))
     return items
+
+
+# ---------------------------------------------------------------------------
+# 顏色（台股慣例：紅＝偏多／上漲、綠＝偏空／下跌）與K線結論卡的一致性判斷
+# ---------------------------------------------------------------------------
+TONE_STYLE = {  # tone: (左邊線顏色, 底色)；底色用半透明，亮色／暗色主題都看得清楚
+    "bull": ("#ff4b4b", "rgba(255, 75, 75, 0.14)"),
+    "bear": ("#21c354", "rgba(33, 195, 84, 0.14)"),
+    "neutral": ("#4c9be8", "rgba(76, 155, 232, 0.14)"),
+}
+LEVEL_TONE = {"success": "bull", "error": "bear", "info": "neutral"}  # 舊的 st.success／error／info 名稱對應到偏多／偏空／中性
+
+
+def tone_html(tone, msg):
+    """偏多（紅）／偏空（綠）／中性（藍）的提示色塊 HTML。msg 內的 **粗體** 會轉成 <b>，其餘文字一律跳脫。"""
+    border, bg = TONE_STYLE[tone]
+    body = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", _html_escape(str(msg), quote=False))
+    return (
+        f'<div style="border-left:4px solid {border};background:{bg};padding:0.75rem 1rem;'
+        f'border-radius:0.5rem;margin:0.25rem 0 0.75rem 0;line-height:1.6;">{body}</div>'
+    )
+
+
+def trend_vote(label):
+    """趨勢標籤 → 投票：偏多（強勢多頭、偏多）＝+1、偏空（偏空、空頭走勢）＝-1、其他＝0。"""
+    return 1 if label in ("強勢多頭", "偏多") else (-1 if label in ("偏空", "空頭走勢") else 0)
+
+
+def directional_alignment(votes):
+    """votes：[(名稱, +1/-1/0/None)]。回傳 (tone, 一句話)。None（沒有資料）略過；至少兩項同向且沒有反向才算一致。"""
+    ups = [n for n, v in votes if v is not None and v > 0]
+    downs = [n for n, v in votes if v is not None and v < 0]
+    if ups and downs:
+        return "neutral", f"⚖️ 判斷分歧：偏多的有「{'、'.join(ups)}」，偏空的有「{'、'.join(downs)}」。建議觀望，或縮小部位並嚴守停損。"
+    if len(ups) >= 2:
+        return "bull", f"🔼 各項一致偏多（{'、'.join(ups)}）：方向相同，仍要依價位設好停損。"
+    if len(downs) >= 2:
+        return "bear", f"🔽 各項一致偏空（{'、'.join(downs)}）：空手先不要買，有持股建議減倉。"
+    return "neutral", "⚪ 目前沒有明確方向，建議觀望。"
