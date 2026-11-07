@@ -17,6 +17,53 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+# ---------------------------------------------------------------------------
+# 錯誤記錄：原本許多地方出錯就默默略過，現在會記下來（側邊欄「資料來源狀態」可查看），方便找出哪個資料來源有問題
+# ---------------------------------------------------------------------------
+import builtins as _builtins
+
+_ERR_STORE = getattr(_builtins, "_stock_app_err_store", None)
+if _ERR_STORE is None:
+    _ERR_STORE = {"lock": threading.Lock(), "data": {}}
+    _builtins._stock_app_err_store = _ERR_STORE  # 放在 builtins，網頁每次重跑都不會被清空
+
+
+def _note_err(where, exc):
+    """記錄一筆被略過的錯誤（同樣的錯誤只記一筆並累計次數）。"""
+    try:
+        key = (where, type(exc).__name__, str(exc)[:120])
+        with _ERR_STORE["lock"]:
+            ent = _ERR_STORE["data"].get(key)
+            now = datetime.datetime.now().strftime("%m-%d %H:%M:%S")
+            if ent:
+                ent[0] += 1
+                ent[1] = now
+            else:
+                if len(_ERR_STORE["data"]) >= 60:
+                    _ERR_STORE["data"].pop(next(iter(_ERR_STORE["data"])))
+                _ERR_STORE["data"][key] = [1, now]
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _timed(name):
+    """記錄一段程式的耗時，顯示在側邊欄「資料來源狀態與耗時」（顯示的是上一次分析的秒數）。"""
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        try:
+            st.session_state.setdefault("_timings", {})[name] = time.perf_counter() - t0
+        except Exception:
+            pass
+
+
+def _err_snapshot():
+    with _ERR_STORE["lock"]:
+        return sorted(((k, v[0], v[1]) for k, v in _ERR_STORE["data"].items()), key=lambda x: x[2], reverse=True)
+
+
 # 💡 中文對照字典（代號 → 中文名稱）
 STOCK_ZH_DICT = {
     "2313.TW": "華通",
@@ -49,7 +96,8 @@ def is_mobile():
     """依瀏覽器 User-Agent 判斷是否為手機（平板視為桌機排版）。"""
     try:
         ua = st.context.headers.get("User-Agent", "")
-    except Exception:
+    except Exception as _exc:
+        _note_err("is_mobile", _exc)
         return False
     return "Mobile" in ua or "iPhone" in ua
 
@@ -81,21 +129,24 @@ def fetch_history(symbol, period):
 def _load_info(symbol):
     try:
         return yf.Ticker(symbol).info or {}
-    except Exception:
+    except Exception as _exc:
+        _note_err("_load_info", _exc)
         return {}
 
 
 def _load_dividends(symbol):
     try:
         return yf.Ticker(symbol).dividends
-    except Exception:
+    except Exception as _exc:
+        _note_err("_load_dividends", _exc)
         return pd.Series(dtype=float)
 
 
 def _load_splits(symbol):
     try:
         return yf.Ticker(symbol).splits
-    except Exception:
+    except Exception as _exc:
+        _note_err("_load_splits", _exc)
         return pd.Series(dtype=float)
 
 
@@ -109,7 +160,8 @@ def _load_eps_quarterly(symbol):
                     row = q_stmt.loc[key].dropna().astype(float)
                     if not row.empty:
                         return row.sort_index(ascending=False)
-    except Exception:
+    except Exception as _exc:
+        _note_err("_load_eps_quarterly", _exc)
         pass
     return pd.Series(dtype=float)
 
@@ -118,7 +170,8 @@ def _load_monthly(symbol):
     try:
         m = yf.Ticker(symbol).history(period="10y", interval="1mo")
         return m.dropna(subset=["Open", "High", "Low", "Close"])
-    except Exception:
+    except Exception as _exc:
+        _note_err("_load_monthly", _exc)
         return pd.DataFrame()
 
 
@@ -147,7 +200,8 @@ def fetch_search_name(symbol):
         quotes = yf.Search(symbol, max_results=1).quotes
         if quotes:
             return quotes[0].get("shortname") or quotes[0].get("longname") or ""
-    except Exception:
+    except Exception as _exc:
+        _note_err("fetch_search_name", _exc)
         pass
     return ""
 
@@ -168,7 +222,7 @@ def _names_from_isin(industry_store=None):
         try:
             resp = requests.get(
                 f"http://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
-                timeout=8,
+                timeout=5,
             )
             html = resp.content.decode("cp950", errors="ignore")
             table = pd.read_html(StringIO(html))[0]
@@ -182,7 +236,8 @@ def _names_from_isin(industry_store=None):
                             industry = str(table.iloc[row_i, 4]).strip()
                             if industry and industry.lower() != "nan":
                                 industry_store[code + suffix] = industry
-        except Exception:
+        except Exception as _exc:
+            _note_err("_names_from_isin", _exc)
             continue
     return result
 
@@ -201,11 +256,12 @@ def _names_from_openapi():
     )
     for url, code_key, name_key, suffix in sources:
         try:
-            for row in requests.get(url, timeout=8).json():
+            for row in requests.get(url, timeout=5).json():
                 code, name = str(row.get(code_key, "")).strip(), str(row.get(name_key, "")).strip()
                 if code and name:
                     result.setdefault(code + suffix, name)
-        except Exception:
+        except Exception as _exc:
+            _note_err("_names_from_openapi", _exc)
             continue
     return result
 
@@ -231,9 +287,16 @@ def get_tw_industry(symbol):
 
 
 def get_tw_names():
+    # 名稱清單來源連不上時，2 分鐘內不再重試（否則每次搜尋都要白等好幾個逾時）
+    if time.time() - _ERR_STORE.get("names_fail_ts", 0) < 120:
+        return {}
     try:
-        return load_tw_stock_names()
-    except Exception:
+        r = load_tw_stock_names()
+        _ERR_STORE["names_fail_ts"] = 0
+        return r
+    except Exception as _exc:
+        _note_err("get_tw_names", _exc)
+        _ERR_STORE["names_fail_ts"] = time.time()
         return {}
 
 
@@ -266,14 +329,19 @@ def get_ticker_from_name(input_text):
             return found
 
     try:
-        quotes = getattr(yf.Search(text, max_results=10), "quotes", [])
+        try:
+            _srch = yf.Search(text, max_results=10, timeout=8)
+        except TypeError:  # 舊版 yfinance 沒有 timeout 參數
+            _srch = yf.Search(text, max_results=10)
+        quotes = getattr(_srch, "quotes", [])
         for q in quotes:
             symbol = q.get("symbol", "").upper()
             if symbol.endswith(".TW") or symbol.endswith(".TWO"):
                 return symbol
         if quotes and quotes[0].get("symbol"):
             return quotes[0]["symbol"].upper()
-    except Exception:
+    except Exception as _exc:
+        _note_err("get_ticker_from_name", _exc)
         pass
     return upper
 
@@ -317,7 +385,8 @@ def _finmind_token():
     """選填：有 FinMind token 可提高每小時請求上限（secrets.toml 或環境變數 FINMIND_TOKEN）。"""
     try:
         token = st.secrets.get("FINMIND_TOKEN", "")
-    except Exception:
+    except Exception as _exc:
+        _note_err("_finmind_token", _exc)
         token = ""
     return token or os.environ.get("FINMIND_TOKEN", "")
 
@@ -557,7 +626,8 @@ def _inst_store():
 def _to_num(x):
     try:
         return float(str(x).replace(",", "").strip() or 0)
-    except Exception:
+    except Exception as _exc:
+        _note_err("_to_num", _exc)
         return 0.0
 
 
@@ -617,6 +687,11 @@ def _fetch_market_day(market, day, store):
     if hit and time.time() - hit[0] < ttl:
         return hit[1]
 
+    # 這個來源剛剛連不上（逾時）：3 分鐘內直接略過，立刻改用備援，不要一天一天重複等逾時
+    _down = _ERR_STORE.setdefault("host_down", {})
+    if time.time() - _down.get(market, 0) < 180:
+        raise RuntimeError("官方來源暫時連不上，已略過（3 分鐘後再試）")
+
     headers = {"User-Agent": "Mozilla/5.0"}
 
     def _request():
@@ -625,7 +700,7 @@ def _fetch_market_day(market, day, store):
                 "https://www.twse.com.tw/rwd/zh/fund/T86",
                 params={"date": day.strftime("%Y%m%d"), "selectType": "ALL", "response": "json"},
                 headers=headers,
-                timeout=10,
+                timeout=(4, 6),
             )
             resp.raise_for_status()
             return _parse_t86(resp.json())
@@ -634,19 +709,23 @@ def _fetch_market_day(market, day, store):
                 "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade",
                 params={"type": "Daily", "sect": "EW", "date": day.strftime("%Y/%m/%d"), "id": "", "response": "json"},
                 headers=headers,
-                timeout=10,
+                timeout=(4, 6),
             )
             resp.raise_for_status()
             return _parse_tpex(resp.json())
 
-    for attempt in range(3):  # 偶爾被官方限流，稍等後重試
+    for attempt in range(2):  # 偶爾被官方限流（HTTP 錯誤），稍等後重試一次；逾時／連不上不重試
         try:
             data = _request()
             break
-        except Exception:
-            if attempt == 2:
+        except Exception as _exc:
+            _note_err("_request", _exc)
+            if isinstance(_exc, (requests.Timeout, requests.ConnectionError)):
+                _down[market] = time.time()  # 標記來源連不上，其他天的請求會立刻放棄
                 raise
-            time.sleep(1.0 * (attempt + 1))
+            if attempt == 1:
+                raise
+            time.sleep(1.0)
 
     if data or day != today:  # 今天還沒公布（空資料）時不要快取，晚點再試
         store[key] = (time.time(), data)
@@ -669,7 +748,8 @@ def fetch_institutional_official(symbol, days=10):
         for d, fut in futures:
             try:
                 data = fut.result()
-            except Exception:
+            except Exception as _exc:
+                _note_err("fetch_institutional_official", _exc)
                 errors += 1
                 continue
             if code in data:
@@ -1113,7 +1193,8 @@ def _news_from_google(query):
             title = title[: -len(f" - {source}")]
         try:
             published = parsedate_to_datetime(it.findtext("pubDate")).astimezone(TW_TZ)
-        except Exception:
+        except Exception as _exc:
+            _note_err("_news_from_google", _exc)
             published = None
         if title and link:
             items.append({"title": title, "link": link, "source": source, "time": published})
@@ -1137,7 +1218,8 @@ def _news_from_yfinance(symbol):
                 published = pd.Timestamp(c["pubDate"]).to_pydatetime().astimezone(TW_TZ)
             elif c.get("providerPublishTime"):
                 published = datetime.datetime.fromtimestamp(c["providerPublishTime"], TW_TZ)
-        except Exception:
+        except Exception as _exc:
+            _note_err("_news_from_yfinance", _exc)
             pass
         if title and link:
             items.append({"title": title, "link": link, "source": source, "time": published})
@@ -1196,7 +1278,8 @@ def is_market_open():
 def _to_float(x):
     try:
         return float(str(x).replace(",", ""))
-    except Exception:
+    except Exception as _exc:
+        _note_err("_to_float", _exc)
         return None
 
 
@@ -1246,7 +1329,8 @@ def _mis_session():
     sess.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/stock/index.jsp"})
     try:
         sess.get("https://mis.twse.com.tw/stock/index.jsp", timeout=5)  # 取得 cookie
-    except Exception:
+    except Exception as _exc:
+        _note_err("_mis_session", _exc)
         pass
     return sess
 
@@ -1295,7 +1379,8 @@ def fetch_realtime_quote(symbol):
     if symbol.endswith((".TW", ".TWO")):
         try:
             return _quote_from_mis(symbol)
-        except Exception:
+        except Exception as _exc:
+            _note_err("fetch_realtime_quote", _exc)
             pass  # 證交所失敗就退回 Yahoo
     return _quote_from_yahoo(symbol)
 
@@ -1470,7 +1555,8 @@ def _trailing_cash_dividend(dividends_series, info):
             total = float(dividends_series[idx >= cutoff].sum())
             if total > 0:
                 return total
-    except Exception:
+    except Exception as _exc:
+        _note_err("_trailing_cash_dividend", _exc)
         pass
     backup = info.get("trailingAnnualDividendRate", info.get("dividendRate", 0))
     return float(backup) if isinstance(backup, (int, float)) and backup > 0 else 0.0
@@ -1518,7 +1604,8 @@ def _fundamental_items(info, pe_ratio, eps_quarterly, dividends_series, latest_c
             if isinstance(g, (int, float)):
                 eps_ok = g > 0
                 eps_detail = f"Yahoo 季獲利年增率 {g * 100:+.1f}%"
-    except Exception:
+    except Exception as _exc:
+        _note_err("_fundamental_items", _exc)
         pass
     items.append(("每股盈餘", "EPS", eps_ok, eps_detail, std))
 
@@ -1866,7 +1953,8 @@ def render_company_intro(symbol, info, display_name):
     sector_zh = SECTOR_ZH.get(info.get("sector") or "", info.get("sector") or "")
     try:
         tw_industry = get_tw_industry(symbol)
-    except Exception:
+    except Exception as _exc:
+        _note_err("render_company_intro", _exc)
         tw_industry = ""
 
     main = INDUSTRY_TAGS.get(code) or YAHOO_INDUSTRY_ZH.get(info.get("industry") or "", "")
@@ -1939,8 +2027,9 @@ if "search_stopped" not in st.session_state:
     st.session_state.search_stopped = False
 
 
+
 # ---------------------------------------------------------------------------
-# 網站累積瀏覽次數、觀察清單（存成本機 JSON，重開網頁或重啟後仍在）、台股升降單位與風險報酬
+# 網站累積瀏覽次數（存成本機 JSON）、台股升降單位與風險報酬
 # ---------------------------------------------------------------------------
 APP_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_app_data.json")
 TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
@@ -1951,7 +2040,8 @@ def _data_load():
         with open(APP_DATA_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
         return d if isinstance(d, dict) else {}
-    except Exception:
+    except Exception as _exc:
+        _note_err("_data_load", _exc)
         return {}
 
 
@@ -1965,18 +2055,9 @@ def _write_data_file(d):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=1)
         os.replace(tmp, APP_DATA_FILE)
-    except Exception:
+    except Exception as _exc:
+        _note_err("_write_data_file", _exc)
         pass
-
-
-def _data_save():
-    """存觀察清單、持股、交易日誌：讀出整份資料檔，只更新自己的欄位，不會蓋掉瀏覽計數。"""
-    with _FILE_LOCK:
-        d = _data_load()
-        d["watchlist"] = st.session_state.watchlist
-        d["holdings"] = st.session_state.holdings
-        d["journal"] = st.session_state.journal
-        _write_data_file(d)
 
 
 def count_visit():
@@ -1998,25 +2079,11 @@ def visit_stats():
     return int(v.get("total", 0)), int((v.get("daily") or {}).get(today, 0))
 
 
-if "watchlist" not in st.session_state:
-    _saved = _data_load()
-    st.session_state.watchlist = _saved.get("watchlist", [])  # [[名稱, 代號], ...]
-    st.session_state.holdings = _saved.get("holdings", [])    # [{name, symbol, cost, shares, date, stop}, ...]
-    st.session_state.journal = _saved.get("journal", [])      # [{name, symbol, buy_date, buy_px, shares, reason, sell_date, sell_px, note}, ...]
 FEE_DISCOUNT = 6.0  # 手續費折數（10＝不打折）；風險報酬比、回測、持股損益都用這個數字，想改直接改這裡
 # 網站累積瀏覽次數：每個新連線只計一次
 if not st.session_state.get("_visit_counted"):
     count_visit()
     st.session_state["_visit_counted"] = True
-
-
-def toggle_watch(symbol, name):
-    wl = st.session_state.watchlist
-    if any(w[1] == symbol for w in wl):
-        st.session_state.watchlist = [w for w in wl if w[1] != symbol]
-    else:
-        wl.append([name, symbol])
-    _data_save()
 
 
 def is_tw_symbol(sym):
@@ -2067,7 +2134,7 @@ SEARCH_INPUT_KEYS = ("input_val",)
 
 def request_search(keyword):
     """任一頁籤按下搜尋：同步所有輸入框，並記下關鍵字；真正的查詢在主流程進行，
-    查完後「目前股票」更新，所有頁籤（個股分析、K線分析、K線分析2）就會一起顯示同一檔股票。"""
+    查完後「目前股票」更新，所有頁籤（個股分析、K線分析）就會一起顯示同一檔股票。"""
     keyword = (keyword or "").strip()
     if not keyword:
         return
@@ -2112,9 +2179,20 @@ def stop_search():
     st.session_state.search_stopped = True
 
 
-def run_search(user_keyword):
-    """把輸入轉成代號、驗證股票存在，並更新搜尋紀錄。"""
+def run_search(user_keyword, progress=None):
+    """把輸入轉成代號、驗證股票存在，並更新搜尋紀錄。progress 是畫面上的placeholder，用來顯示目前進行到哪一步。"""
+    _t0 = time.perf_counter()
+
+    def _say(msg):
+        if progress is not None:
+            try:
+                progress.caption(f"⏱ {time.perf_counter() - _t0:.0f} 秒｜{msg}")
+            except Exception:
+                pass
+
+    _say("① 查詢股票代號（中文名稱需下載台股名稱清單）…")
     symbol = get_ticker_from_name(user_keyword)
+    _say(f"② 已找到代號 {symbol}，驗證股價資料…")
 
     # 驗證股票是否存在；台股 .TW 查不到時，再試上櫃 .TWO
     candidates = [symbol]
@@ -2127,13 +2205,15 @@ def run_search(user_keyword):
             if not fetch_history(cand, TIME_PERIOD).empty:
                 valid_symbol = cand
                 break
-        except Exception:
+        except Exception as _exc:
+            _note_err("run_search", _exc)
             continue
 
     if valid_symbol is None:
         st.session_state.trigger_search = "FAILED:" + user_keyword
         return
 
+    _say("③ 取得股票名稱…")
     display_name = resolve_display_name(valid_symbol, user_keyword)
     st.session_state.trigger_search = valid_symbol
     st.session_state.current_name = display_name
@@ -2184,7 +2264,8 @@ def render_analysis(symbol_upper, time_period):
                 total_cash = dividends_series[idx >= one_year_ago].sum()
                 if total_cash > 0:
                     cash_dividend = f"{total_cash:.2f} 元"
-        except Exception:
+        except Exception as _exc:
+            _note_err("render_analysis", _exc)
             pass
 
         try:
@@ -2198,7 +2279,8 @@ def render_analysis(symbol_upper, time_period):
                         total_stock += val
                 if total_stock > 0:
                     stock_dividend = f"{total_stock:.2f} 元"
-        except Exception:
+        except Exception as _exc:
+            _note_err("render_analysis", _exc)
             pass
 
         if cash_dividend == "0.00 元":
@@ -2323,6 +2405,14 @@ def render_analysis(symbol_upper, time_period):
             xaxis_rangeslider_visible=False,
         )
         show_chart(fig)
+        try:
+            _csv = df.reset_index().to_csv(index=False).encode("utf-8-sig")  # utf-8-sig：Excel 開啟中文不亂碼
+            st.download_button(
+                "⬇️ 下載歷史價格 CSV", _csv, file_name=f"{symbol_upper}_history.csv", mime="text/csv",
+                key=f"dl_hist_{symbol_upper}",
+            )
+        except Exception as _exc:
+            _note_err("render_analysis.csv", _exc)
 
         inst_table = render_institutional(symbol_upper)
         daily_res = render_daily_analysis(symbol_upper)
@@ -2330,7 +2420,8 @@ def render_analysis(symbol_upper, time_period):
         try:
             fund_items = _fundamental_items(info, pe_ratio, eps_quarterly, dividends_series, latest_close)
             tech_items = _technical_items(daily_res[2] if daily_res else None)
-        except Exception:
+        except Exception as _exc:
+            _note_err("render_analysis", _exc)
             fund_items, tech_items = None, None
         render_beacons(
             beacon_slot, pe_ratio, eps_last4, inst_table, daily_res, monthly_res, fund_items, tech_items
@@ -2376,7 +2467,8 @@ def _mis_batch(sess, batch):
             if arr:
                 time.sleep(0.3)  # 對官方網站客氣一點
                 return arr
-        except Exception:
+        except Exception as _exc:
+            _note_err("_mis_batch", _exc)
             pass
         time.sleep(0.8)
     return None
@@ -2399,7 +2491,8 @@ def fetch_sparklines(symbols, bucket):
             list(symbols), period="5d", interval="5m", group_by="ticker",
             progress=False, threads=True, auto_adjust=False,
         )
-    except Exception:
+    except Exception as _exc:
+        _note_err("fetch_sparklines", _exc)
         raw = None
     for s in (symbols if raw is not None else ()):
         try:
@@ -2416,7 +2509,8 @@ def fetch_sparklines(symbols, bucket):
             close = close[[ts.date() == last_day for ts in close.index]]
             if len(close) >= 2:
                 out[s] = [float(v) for v in close.values]
-        except Exception:
+        except Exception as _exc:
+            _note_err("fetch_sparklines", _exc)
             continue
     if _fugle_key():  # Yahoo 沒抓到的，改用 Fugle 當日 5 分 K 補上
         for s in symbols:
@@ -2427,7 +2521,8 @@ def fetch_sparklines(symbols, bucket):
                 closes = [float(c["close"]) for c in js.get("data") or [] if c.get("close")]
                 if len(closes) >= 2:
                     out[s] = closes
-            except Exception:
+            except Exception as _exc:
+                _note_err("fetch_sparklines", _exc)
                 continue
     return out
 
@@ -2502,7 +2597,8 @@ def _fugle_key():
                 for kk in v.keys():
                     if isinstance(v[kk], str) and v[kk].strip():
                         return v[kk].strip()
-    except Exception:
+    except Exception as _exc:
+        _note_err("_fugle_key", _exc)
         pass
     for k, v in os.environ.items():
         if "FUGLE" in k.upper() and v.strip():
@@ -2770,7 +2866,8 @@ def _inst_rank_official():
     otc_ok = True
     try:
         data_otc = _fetch_market_day("OTC", day, store)
-    except Exception:
+    except Exception as _exc:
+        _note_err("_inst_rank_official", _exc)
         data_otc, otc_ok = {}, False
     by_code = {(c, ".TW"): v for c, v in data_tw.items()}
     by_code.update({(c, ".TWO"): v for c, v in data_otc.items()})
@@ -3393,6 +3490,25 @@ def _prediction_pack(d, sigs):
     return d, A, by
 
 
+K2_PAT_PTS, K2_PAT_CAP = 10, 15  # 18 種型態加減分：最近 3 根日K，每組偏多 +10／偏空 -10，合計上限 ±15（權重為經驗設定，未回測）
+
+
+def _k2_pattern_factor(d):
+    """把「K線型態」的 18 種型態訊號併入預測分數。回傳 (加減分, 型態說明文字, 日K資料, 型態群組)。"""
+    try:
+        dd = k2_resample(d, "日")
+        cl = k2_cluster(k2_detect_cached(dd, 5, "日", tuple(sorted(K2_DEFAULT_SELECTED))))
+    except Exception as _exc:
+        _note_err("_k2_pattern_factor", _exc)
+        return 0, "", None, []
+    recent = [c for c in cl if c["e"] >= len(dd) - 3]
+    nb = sum(1 for c in recent if c["primary"]["direction"] == "bull")
+    nr = sum(1 for c in recent if c["primary"]["direction"] == "bear")
+    pts = max(-K2_PAT_CAP, min(K2_PAT_CAP, (nb - nr) * K2_PAT_PTS))
+    names = "、".join(("▲" if c["primary"]["direction"] == "bull" else "▼") + c["primary"]["name"] for c in recent)
+    return int(pts), names, dd, cl
+
+
 def _render_prediction(d, sigs, inst_table=None):
     d, A, by = _prediction_pack(d, sigs)
     n = len(d)
@@ -3400,6 +3516,10 @@ def _render_prediction(d, sigs, inst_table=None):
     vol_lots = {ix.strftime("%Y-%m-%d"): float(v) / 1000 for ix, v in d["Volume"].items()}
     inst = _inst_score(inst_table, vol_lots)
     score, reasons = _score_at(A, by, i, inst)
+    pat_pts, pat_txt, k2_df, k2_cl = _k2_pattern_factor(d)  # 併入「K線型態」的 18 種型態判斷
+    score = int(max(-100, min(100, score + pat_pts)))
+    if pat_pts:
+        reasons.append((pat_pts, f"最近 3 根日K型態：{pat_txt}"))
 
     # 下一個交易日（只跳過週末，不含國定假日）
     nd = d.index[-1] + datetime.timedelta(days=1)
@@ -3440,11 +3560,13 @@ def _render_prediction(d, sigs, inst_table=None):
 
     # 因子分項
     pv_pts, _ = _pv_score(A, i)
-    k_pts = score - pv_pts - inst[0]
-    f1, f2, f3 = st.columns(3)
-    f1.metric("技術面（K線／均線／指標）", f"{k_pts:+d}")
+    k_pts = score - pv_pts - inst[0] - pat_pts
+    f1, f2, f3, f4 = st.columns(4)
+    f1.metric("技術面（均線／指標）", f"{k_pts:+d}")
     f2.metric("量價關係", f"{pv_pts:+d}")
     f3.metric("三大法人籌碼", f"{inst[0]:+d}" if inst[1] else "無資料")
+    f4.metric("K線型態（18 型態）", f"{pat_pts:+d}", help="最近 3 根日K有符合的型態：偏多加分、偏空減分，詳見下方「K線型態」區。")
+    st.caption("🕯️ 最近 3 根日K型態：" + (pat_txt or "沒有符合條件的型態"))
     if inst_table is not None and not inst_table.empty:
         if inst_table.index[-1] != d.index[-1].strftime("%Y-%m-%d"):
             st.caption(f"ℹ️ 法人資料最新為 {inst_table.index[-1]}（當日資料可能尚未公布），籌碼因子以此日為準。")
@@ -3496,6 +3618,23 @@ def _render_prediction(d, sigs, inst_table=None):
             f"收盤跌破 {_pz(px2(zlo * ZONE_BREAK_PCT))} 就不要買"
         )
 
+    # 併入「K線型態」的價位：最近 3 根日K 的偏多型態給買點，偏空型態給反彈減倉區
+    bull_h = [m for c in k2_cl if k2_df is not None and c["e"] >= len(k2_df) - 3 for m in c["members"] if m["direction"] == "bull"]
+    bear_h = [m for c in k2_cl if k2_df is not None and c["e"] >= len(k2_df) - 3 for m in c["members"] if m["direction"] == "bear"]
+    pick_h = lambda hs: max(hs, key=lambda x: (x["g"], x["e"]))
+    try:
+        if bull_h:
+            hb = pick_h(bull_h)
+            lv = k2_hit_levels(k2_df, hb)
+            b_lines.append(
+                f"- 🕯️ **型態買點**：{_pz_range(px2(lv['lo']), px2(lv['hi']))}（▲{hb['name']}）　"
+                f"跌破 {_pz(px2(lv['stop']))} 型態失效，要停損"
+            )
+        if bear_h:
+            b_lines.append(f"- ⚠️ 同時有偏空型態（{'、'.join(x['name'] for x in bear_h)}），要買建議縮小部位")
+    except Exception as _exc:
+        _note_err("_render_prediction.k2_buy", _exc)
+
     # ---- 持有的人 ----
     if verdict == "bull":
         s_stance = "✅ **偏多：可以續抱**"
@@ -3513,6 +3652,18 @@ def _render_prediction(d, sigs, inst_table=None):
         f"- 🟡 **減倉價**：{_pz_range(s_lo, s_hi)}　{s_how}",
         f"- 🛑 **停損價**：{_pz(px2(support))}　收盤跌破就全部賣掉",
     ]
+    try:
+        if bear_h:
+            hs_ = pick_h(bear_h)
+            lv = k2_hit_levels(k2_df, hs_)
+            s_lines.append(
+                f"- 🕯️ **型態反彈減倉區**：{_pz_range(px2(lv['lo']), px2(lv['hi']))}（▼{hs_['name']}）　"
+                f"反彈到這區先賣一部分，跌破 {_pz(px2(lv['stop']))} 轉弱"
+            )
+        if bull_h:
+            s_lines.append(f"- 🕯️ 同時有偏多型態（{'、'.join(x['name'] for x in bull_h)}），可續抱，但停損價仍要守")
+    except Exception as _exc:
+        _note_err("_render_prediction.k2_sell", _exc)
     if verdict == "bear":
         s_lines.append(f"- ⚠️ 若一開盤就直接跌破 {_pz(px_(close - atr))}，不要再凹單，直接出場")
     if zone:
@@ -3520,18 +3671,20 @@ def _render_prediction(d, sigs, inst_table=None):
             f"- 🧱 下檔大量支撐區 {_pz_range(px2(zlo), px2(zhi))}：收盤跌破 {_pz(px2(zlo * ZONE_BREAK_PCT))} 代表支撐失效，必須停損"
         )
 
-    st.markdown("**📌 隔日進出場參考**")
-    col_b, col_s = st.columns(2)
-    for col, title, stance, lines in (
-        (col_b, "📈 想買的人：什麼價位進、什麼價位出", b_stance, b_lines),
-        (col_s, "📉 持有的人：什麼價位減倉、什麼價位停損", s_stance, s_lines),
-    ):
-        with col, st.container(border=True):
-            st.markdown(f"##### {title}")
-            st.markdown(stance)
-            st.markdown("\n".join(lines), unsafe_allow_html=True)
-    st.caption("以上是依均線、近期高低點與波動算的參考，價位已對齊台股升降單位、隔日價位限制在漲跌幅 ±10% 內；"
-               "不保證會漲跌，買進後務必先設好停損。")
+    # 放在頁籤上方、綜合判斷卡的下方（entry_slot 在主畫面建立），不論切到哪個頁籤都看得到
+    with entry_slot.container():
+        st.markdown("**📌 隔日進出場參考**")
+        col_b, col_s = st.columns(2)
+        for col, title, stance, lines in (
+            (col_b, "📈 想買的人：什麼價位進、什麼價位出", b_stance, b_lines),
+            (col_s, "📉 持有的人：什麼價位減倉、什麼價位停損", s_stance, s_lines),
+        ):
+            with col, st.container(border=True):
+                st.markdown(f"##### {title}")
+                st.markdown(stance)
+                st.markdown("\n".join(lines), unsafe_allow_html=True)
+        st.caption("以上是依均線、近期高低點與波動算的參考，價位已對齊台股升降單位、隔日價位限制在漲跌幅 ±10% 內；"
+                   "不保證會漲跌，買進後務必先設好停損。")
     st.session_state["_k1_pred"] = {"symbol": st.session_state.get("trigger_search", ""), "score": int(score), "verdict": verdict}
 
     # 回測：這檔股票過去同樣判斷，隔天實際表現
@@ -3556,7 +3709,7 @@ def _render_prediction(d, sigs, inst_table=None):
             )
         else:
             st.caption("📊 歷史參考：過去一年同樣判斷的次數太少（不足 5 次），無法回測參考。")
-    st.caption("（回測只含技術面與量價因子；法人資料只取得近 10 個交易日，無法回測整年。）")
+    st.caption("（回測只含技術面與量價因子，不含法人與 18 型態加分；法人資料只取得近 10 個交易日，無法回測整年。）")
     if inst_table is not None and not inst_table.empty:
         with st.expander("🏦 三大法人近期買賣超明細（張）"):
             st.dataframe(inst_table.sort_index(ascending=False), width="stretch")
@@ -3575,7 +3728,8 @@ def _kline_price_body(symbol, last_close, prev_bar_close):
         prev = float(prev) if isinstance(prev, (int, float)) and prev else prev_bar_close
         label, tip = "現價", f"資料時間 {q['time']}　來源：{q['source']}"
         cap = f"⚡ {str(q['time'])[-8:]}　K線最新收盤 {last_close:.2f}"
-    except Exception:
+    except Exception as _exc:
+        _note_err("_kline_price_body", _exc)
         price, prev, label = last_close, prev_bar_close, "最新收盤"
         tip, cap = "目前無法取得即時報價，顯示最近一根K線的收盤價。", "⚠️ 無即時報價，顯示最近收盤"
     chg = price - prev
@@ -3605,7 +3759,8 @@ def render_kline_analysis():
         for cand in [symbol] + ([symbol[:-3] + ".TWO"] if symbol.endswith(".TW") else []):
             try:
                 hist = fetch_history(cand, "1y")
-            except Exception:
+            except Exception as _exc:
+                _note_err("render_kline_analysis", _exc)
                 continue
             if not hist.empty:
                 valid = cand
@@ -3682,10 +3837,12 @@ def render_kline_analysis():
         with st.spinner("⏳ 分析中（讀取法人資料），請稍候…"):
             try:
                 inst_table = fetch_institutional_official(valid, days=10)
-            except Exception:
+            except Exception as _exc:
+                _note_err("_names", _exc)
                 try:
                     inst_table = summarize_institutional(fetch_institutional_raw(valid.split(".")[0]), days=10)
-                except Exception:
+                except Exception as _exc:
+                    _note_err("_names", _exc)
                     inst_table = None
     st.session_state["_k1_inst"] = (valid, inst_table)
     _render_prediction(d, sigs, inst_table)
@@ -4133,6 +4290,12 @@ def k2_detect(df, n_trend, period, selected=None):
     return hits
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def k2_detect_cached(df, n_trend, period, sel_key):
+    """k2_detect 的快取版：同一份資料與設定在 10 分鐘內不重複掃描 18 種型態。sel_key 為 None 或已排序的型態名稱 tuple。"""
+    return k2_detect(df, n_trend, period, None if sel_key is None else set(sel_key))
+
+
 def k2_cluster(hits):
     """把互相重疊的型態合成一組標註：以根數最多者為主要型態，其餘列為「+N」。"""
     order = sorted(range(len(hits)), key=lambda k: (-hits[k]["g"], hits[k]["s"]))
@@ -4430,7 +4593,7 @@ def _k2_range_txt(lo, hi):
 
 
 def _render_k2_price_blocks(df, clusters, period, stats=None):
-    """K線分析2 的兩個白話價位區塊：想買的人（進場價／停損價／獲利價）、持有的人（減倉價／停損價）。"""
+    """K線型態頁的兩個白話價位區塊：想買的人（進場價／停損價／獲利價）、持有的人（減倉價／停損價）。"""
     n = len(df)
     px = float(df["Close"].iloc[-1])
     recent = [cl for cl in clusters if cl["e"] >= n - 3]
@@ -4527,7 +4690,7 @@ def _render_k2_price_blocks(df, clusters, period, stats=None):
 
 
 def render_kline_analysis2():
-    st.markdown("##### 📐 K線分析2：18 種K線型態標註（參考處置王「K線技術分析教學」）")
+    st.markdown("##### 🕯️ K線型態：18 種K線型態標註（參考處置王「K線技術分析教學」）")
     period = st.radio("K線週期", ["日", "週", "月", "季"], horizontal=True, key="k2_period",
                       format_func=lambda p: f"{p}K")
     opts = K2_BARS[period]
@@ -4568,7 +4731,8 @@ def render_kline_analysis2():
         for cand in [symbol] + ([symbol[:-3] + ".TWO"] if symbol.endswith(".TW") else []):
             try:
                 hist = fetch_history(cand, "10y")  # 月K、季K 需要較長的歷史
-            except Exception:
+            except Exception as _exc:
+                _note_err("render_kline_analysis2", _exc)
                 continue
             if not hist.empty:
                 valid = cand
@@ -4583,7 +4747,7 @@ def render_kline_analysis2():
         st.warning(f"{period}K 資料不足（只有 {len(df)} 根），無法判斷型態；請改選較短的週期。")
         return
 
-    hits = k2_detect(df, n_trend, period, selected) if on else []
+    hits = k2_detect_cached(df, n_trend, period, None if selected is None else tuple(sorted(selected))) if on else []
     clusters = k2_cluster(hits)
     n = len(df)
     start = max(0, n - bars)
@@ -4663,7 +4827,10 @@ def render_kline_analysis2():
     # ---- 進出場價格參考：想購買者／持有者 ----
     full = k2_resample(hist, period, tail=None)
     stats = k2_stats_cached(valid, period, n_trend, str(full.index[-1]), full) if on else {}
-    _render_k2_price_blocks(df, clusters, period, stats)
+    if period == "日":
+        st.info("📌 日K 的進出場價位已整合進上方「隔日進出場參考」，這裡不重複顯示；切換到週／月／季K 會顯示該週期的價位。")
+    else:
+        _render_k2_price_blocks(df, clusters, period, stats)
 
     # ---- 標註明細 ----
     st.markdown(f"**📋 型態標註明細**（共 {len(shown_cl)} 組，新 → 舊）")
@@ -4806,7 +4973,8 @@ def _find_key(row, *needles):
 def _num(x):
     try:
         return float(str(x).replace(",", "").replace("%", "").strip())
-    except Exception:
+    except Exception as _exc:
+        _note_err("_num", _exc)
         return None
 
 
@@ -4833,7 +5001,8 @@ def fetch_monthly_revenue(symbol):
            else "https://openapi.twse.com.tw/v1/opendata/t187ap05_L")
     try:
         return parse_monthly_revenue(_get_json(url), code)
-    except Exception:
+    except Exception as _exc:
+        _note_err("fetch_monthly_revenue", _exc)
         return None
 
 
@@ -4849,7 +5018,8 @@ def _roc_to_date(s):
         if len(digits) >= 3:
             y = int(digits[0])
             return datetime.date(y + 1911 if y < 1911 else y, int(digits[1]), int(digits[2]))
-    except Exception:
+    except Exception as _exc:
+        _note_err("_roc_to_date", _exc)
         return None
     return None
 
@@ -4900,7 +5070,8 @@ def fetch_events(symbol):
     for path in ("announcement/punish", "announcement/notice", "exchangeReport/TWT48U_ALL"):
         try:
             got.append(_get_json(base + path))
-        except Exception:
+        except Exception as _exc:
+            _note_err("fetch_events", _exc)
             got.append([])
     return parse_events(code, got[0], got[1], got[2], datetime.datetime.now(TW_TZ).date())
 
@@ -4934,7 +5105,8 @@ def fetch_margin(symbol):
                 if res:
                     res["date"] = d.isoformat()
                     return res
-        except Exception:
+        except Exception as _exc:
+            _note_err("fetch_margin", _exc)
             continue
     return None
 
@@ -4952,7 +5124,8 @@ def relative_strength(hist, symbol):
                 out["s" + tag] = float(c.iloc[-1] / c.iloc[-1 - n_] - 1)
                 out["m" + tag] = float(idx.iloc[-1] / idx.iloc[-1 - n_] - 1)
         return out if "s3" in out else None
-    except Exception:
+    except Exception as _exc:
+        _note_err("relative_strength", _exc)
         return None
 
 
@@ -4969,25 +5142,53 @@ def _period_trend(df):
     return 1 if px > ma5 > ma10 else -1 if px < ma5 < ma10 else 0
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _twii_live():
+    """證交所即時行情的加權指數（代號 t00）。回傳 {date, price}；取不到回傳 None（失敗結果也會快取 60 秒，避免每次重跑都等逾時）。"""
+    try:
+        resp = _mis_session().get(
+            "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+            params={"ex_ch": "tse_t00.tw", "json": "1", "delay": "0", "_": int(time.time() * 1000)},
+            timeout=3,
+        )
+        resp.raise_for_status()
+        arr = resp.json().get("msgArray") or []
+        r = arr[0] if arr else {}
+        z = str(r.get("z", "")).replace(",", "")
+        if z in ("", "-") or not r.get("d"):
+            return None
+        return {"date": pd.Timestamp(str(r["d"])), "price": float(z)}
+    except Exception as _exc:
+        _note_err("_twii_live", _exc)
+        return None
+
+
+def _twii_close_series():
+    """加權指數近半年收盤序列。Yahoo 的 ^TWII 日K 常慢一天，所以用證交所即時行情補上最新一天。
+    回傳 (序列, 最新資料日期 'MM/DD', 來源說明)。"""
+    idx = fetch_history("^TWII", "6mo")["Close"].dropna()
+    idx.index = pd.DatetimeIndex(idx.index).tz_localize(None).normalize()
+    src = "Yahoo"
+    q = _twii_live()
+    if q:
+        if q["date"] > idx.index[-1]:
+            idx.loc[q["date"]] = q["price"]
+            src = "證交所即時行情"
+        elif q["date"] == idx.index[-1]:
+            idx.iloc[-1] = q["price"]
+            src = "證交所即時行情"
+    return idx, idx.index[-1].strftime("%m/%d"), src
+
+
 def summarize_stock(symbol, hist):
-    """把四個來源的判斷收在一起：K線分析預測、K線型態、日週月多週期、大盤。回傳 (投票列表, 說明列表)。"""
+    """把各來源的判斷收在一起：K線分析（已含K線型態）、日週月多週期、相對強弱、基本面、籌碼、大盤。回傳 (投票列表, 說明列表)。"""
     votes, rows = [], []
 
     k1 = st.session_state.get("_k1_pred")
     if k1 and k1.get("symbol") == symbol:
         v = {"bull": 1, "bear": -1}.get(k1["verdict"], 0)
-        votes.append(("K線分析預測", v))
-        rows.append(("K線分析預測（均線、指標、量價）", _VOTE_TXT[v], f"預測分數 {k1['score']:+d}"))
-
-    d = k2_resample(hist, "日")
-    cl = k2_cluster(k2_detect(d, 5, "日", K2_DEFAULT_SELECTED))
-    recent = [c for c in cl if c["e"] >= len(d) - 3]
-    nb = sum(1 for c in recent if c["primary"]["direction"] == "bull")
-    nr = sum(1 for c in recent if c["primary"]["direction"] == "bear")
-    v = 1 if nb > nr else -1 if nr > nb else 0
-    votes.append(("K線型態", v))
-    names = "、".join(("▲" if c["primary"]["direction"] == "bull" else "▼") + c["primary"]["name"] for c in recent)
-    rows.append(("K線型態（最近 3 根日K）", _VOTE_TXT[v], names or "沒有符合條件的型態"))
+        votes.append(("K線分析", v))
+        rows.append(("K線分析（均線、指標、量價、K線型態）", _VOTE_TXT[v], f"預測分數 {k1['score']:+d}"))
 
     tr = {p: _period_trend(k2_resample(hist, p)) for p in ("日", "週", "月")}
     ok = {p: x for p, x in tr.items() if x is not None}
@@ -5017,7 +5218,8 @@ def summarize_stock(symbol, hist):
         try:
             pe = (fetch_fundamentals(symbol)[0] or {}).get("trailingPE")
             pe_txt = f"；本益比 {float(pe):.1f} 倍" if pe else ""
-        except Exception:
+        except Exception as _exc:
+            _note_err("summarize_stock", _exc)
             pass
         ytd = f"，累計年增 {rev['ytd']:+.1f}%" if rev.get("ytd") is not None else ""
         rows.append(("基本面：月營收", _VOTE_TXT[v], f"{rev['ym']} 營收年增 {rev['yoy']:+.1f}%{ytd}{pe_txt}"))
@@ -5043,13 +5245,14 @@ def summarize_stock(symbol, hist):
 
     if is_tw_symbol(symbol):
         try:
-            idx = fetch_history("^TWII", "6mo")["Close"].dropna()
+            idx, idx_day, idx_src = _twii_close_series()
             ma20 = float(idx.tail(20).mean())
             v = 1 if float(idx.iloc[-1]) > ma20 else -1
             votes.append(("大盤", v))
             rows.append(("大盤（加權指數）", _VOTE_TXT[v],
-                         f"{float(idx.iloc[-1]):,.0f}，{'站上' if v > 0 else '跌破'} 20 日均價 {ma20:,.0f}"))
-        except Exception:
+                         f"{float(idx.iloc[-1]):,.0f}（{idx_day}，{idx_src}），{'站上' if v > 0 else '跌破'} 20 日均價 {ma20:,.0f}"))
+        except Exception as _exc:
+            _note_err("summarize_stock", _exc)
             pass
     return votes, rows
 
@@ -5061,7 +5264,8 @@ def render_summary_card():
         return
     try:
         hist = fetch_history(symbol, "10y")
-    except Exception:
+    except Exception as _exc:
+        _note_err("render_summary_card", _exc)
         return
     if hist is None or hist.empty:
         return
@@ -5072,11 +5276,7 @@ def render_summary_card():
     now_txt = datetime.datetime.now(TW_TZ).strftime("%H:%M:%S")
 
     with st.container(border=True):
-        head, btn = st.columns([5, 1.4], vertical_alignment="center")
-        head.markdown(f"#### 📋 綜合判斷：{name or symbol}（{symbol}）　最新收盤 {last_close:,.2f}")
-        watched = any(w[1] == symbol for w in st.session_state.watchlist)
-        btn.button("★ 移出觀察清單" if watched else "⭐ 加入觀察清單", key="watch_toggle", on_click=toggle_watch,
-                   args=(symbol, name or symbol), width="stretch")
+        st.markdown(f"#### 📋 綜合判斷：{name or symbol}（{symbol}）　最新收盤 {last_close:,.2f}")
         for level, msg in fetch_events(symbol):
             {"error": st.error, "warning": st.warning}.get(level, st.info)(msg)
         if bulls and not bears and len(bulls) >= 2:
@@ -5098,362 +5298,11 @@ def render_summary_card():
         )
 
 
-def render_watchlist():
-    st.markdown("##### ⭐ 觀察清單：一鍵掃描哪幾檔出現了K線型態")
-    wl = st.session_state.watchlist
-    if not wl:
-        st.info("清單還是空的。先搜尋一檔股票，再按上方綜合判斷卡的「⭐ 加入觀察清單」。")
-        return
-
-    c1, c2 = st.columns([1.2, 4], vertical_alignment="center")
-    scan = c1.button("🔍 掃描全部", type="primary", key="watch_scan_btn", width="stretch")
-    flt = c2.radio("顯示", ["全部", "只看偏多型態", "只看偏空型態"], horizontal=True, key="watch_filter")
-
-    if scan:
-        rows, bar = [], st.progress(0.0, text="⏳ 分析中，請稍候…")
-        items = wl[:30]
-        for k, (nm, sym) in enumerate(items):
-            bar.progress((k + 1) / len(items), text=f"⏳ 分析中：{nm}（{k + 1}／{len(items)}）")
-            try:
-                hist = fetch_history(sym, "10y")
-                d = k2_resample(hist, "日")
-                cl = k2_cluster(k2_detect(d, 5, "日", K2_DEFAULT_SELECTED))
-                recent = [c for c in cl if c["e"] >= len(d) - 3]
-                nb = sum(1 for c in recent if c["primary"]["direction"] == "bull")
-                nr = sum(1 for c in recent if c["primary"]["direction"] == "bear")
-                tr = {p: _period_trend(k2_resample(hist, p)) for p in ("日", "週", "月")}
-                px = float(d["Close"].iloc[-1])
-                rows.append({
-                    "股票": nm, "代號": sym, "現價": round(px, 2),
-                    "近5日": f"{(px / float(d['Close'].iloc[-6]) - 1) * 100:+.1f}%" if len(d) > 6 else "—",
-                    "日／週／月": " ".join("—" if x is None else {1: "▲", -1: "▼", 0: "－"}[x] for x in tr.values()),
-                    "近 3 日型態": "、".join(("▲" if c["primary"]["direction"] == "bull" else "▼") + c["primary"]["name"] for c in recent) or "—",
-                    "_bias": 1 if nb > nr else -1 if nr > nb else 0,
-                })
-            except Exception:
-                rows.append({"股票": nm, "代號": sym, "現價": None, "近5日": "—", "日／週／月": "—",
-                             "近 3 日型態": "取不到資料", "_bias": 0})
-        bar.empty()
-        st.session_state["watch_scan"] = {"time": datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S"), "rows": rows}
-
-    res = st.session_state.get("watch_scan")
-    if res:
-        rows = res["rows"]
-        if flt == "只看偏多型態":
-            rows = [r for r in rows if r["_bias"] > 0]
-        elif flt == "只看偏空型態":
-            rows = [r for r in rows if r["_bias"] < 0]
-        st.caption(f"掃描時間 {res['time']}（▲ 偏多／▼ 偏空／－ 整理；日週月方向用收盤與 5、10 根均價判斷）")
-        if rows:
-            st.dataframe(pd.DataFrame(rows).drop(columns=["_bias"]), hide_index=True, width="stretch")
-        else:
-            st.caption("沒有符合條件的股票。")
-    else:
-        st.caption(f"清單共 {len(wl)} 檔；按「掃描全部」查看每檔最近 3 根日K有沒有出現型態。")
-
-    pick = st.selectbox("選一檔", range(len(wl)), format_func=lambda k: f"{wl[k][0]}（{wl[k][1]}）", key="watch_pick")
-    b1, b2, _sp = st.columns([1.2, 1.2, 4])
-    b1.button("👀 查看這檔", key="watch_open", on_click=click_history_btn, args=(wl[pick][1], wl[pick][0]), width="stretch")
-    b2.button("🗑️ 移出清單", key="watch_remove", on_click=toggle_watch, args=(wl[pick][1], wl[pick][0]), width="stretch")
-
-
-def resolve_input_symbol(text):
-    """把使用者輸入（代號或中文名）解析成可查價的代號；留白＝目前搜尋的股票。回傳 (代號, 名稱) 或 (None, None)。"""
-    text = (text or "").strip()
-    if not text:
-        sym, name, _ = current_stock()
-        return (sym, name) if sym else (None, None)
-    sym = get_ticker_from_name(text)
-    for cand in [sym] + ([sym[:-3] + ".TWO"] if sym.endswith(".TW") else []):
-        try:
-            h = fetch_history(cand, "1mo")
-        except Exception:
-            continue
-        if h is not None and not h.empty:
-            return cand, resolve_display_name(cand, text)
-    return None, None
-
-
-def _fees(sym):
-    tw = is_tw_symbol(sym)
-    return (0.001425 * FEE_DISCOUNT / 10, 0.003) if tw else (0.0, 0.0)
-
-
-def holding_calc(h, daily, px_live=None):
-    """單一持股的損益、停損、分批與移動停利。
-    停損：自己填的停損價，沒填就用「成本 − 2×ATR」。R＝成本到停損價的距離。
-    階段 1（最高價曾到成本＋1R）：停損上移到成本價（保本）；階段 2（曾到＋2R）：改用「最高價 − 2.5×ATR」移動停損。"""
-    d = daily
-    H, L, C = (d[k].to_numpy(float) for k in ("High", "Low", "Close"))
-    prev = np.concatenate([[C[0]], C[:-1]])
-    atr = float(pd.Series(np.maximum(H - L, np.maximum(np.abs(H - prev), np.abs(L - prev)))).rolling(14).mean().iloc[-1])
-    px = float(px_live) if px_live else float(C[-1])
-    cost, shares, sym = float(h["cost"]), int(h["shares"]), h["symbol"]
-    sub = d.tail(20)
-    bd = _parse_date_str(h.get("date"))
-    if bd:
-        try:
-            ts = pd.Timestamp(bd)
-            ts = ts.tz_localize(d.index.tz) if d.index.tz is not None else ts
-            sub = d[d.index >= ts] if len(d[d.index >= ts]) else d.tail(20)
-        except Exception:
-            pass
-    hh = max(float(sub["High"].max()), px)
-    init_stop = float(h.get("stop") or 0) or snap_price(cost - 2 * atr, sym)
-    R = cost - init_stop
-    if R <= 0:
-        R = 2 * atr
-        init_stop = snap_price(cost - R, sym)
-    t1, t2, t3 = (snap_price(cost + k * R, sym) for k in (1, 2, 3))
-    stage = 2 if hh >= cost + 2 * R else 1 if hh >= cost + R else 0
-    trail = hh - 2.5 * atr
-    active = init_stop
-    if stage >= 1:
-        active = max(active, cost)
-    if stage >= 2:
-        active = max(active, trail)
-    active = snap_price(active, sym)
-    fee, tax = _fees(sym)
-    cost_all = shares * cost * (1 + fee)
-    pnl = shares * px * (1 - fee - tax) - cost_all
-    risk_to_stop = cost_all - shares * active * (1 - fee - tax)  # 負數＝停損價已高於成本，鎖住獲利
-    vol20 = float(d["Volume"].tail(20).mean())
-    if px <= active:
-        status = "🔴 已跌破目前停損價，建議出場，不要硬等。"
-    elif px - active <= atr:
-        status = "🟠 離停損價不到 1 個 ATR，隨時可能觸發，請盯緊。"
-    elif stage >= 2:
-        status = "🟢 已進入移動停利：停損價會隨新高往上移，抱著賺，跌破才出。"
-    elif stage == 1:
-        status = "🟢 已賺過 1R，停損已上移到成本價（保本）；可先賣出約 1/3 落袋。"
-    else:
-        status = "⚪ 續抱，守住停損價。"
-    return {
-        "px": px, "atr": atr, "stop0": init_stop, "R": R, "t1": t1, "t2": t2, "t3": t3, "stage": stage,
-        "active": active, "hh": hh, "mv": shares * px, "pnl": pnl, "pnl_pct": pnl / cost_all if cost_all else 0.0,
-        "risk": risk_to_stop, "status": status, "liq": (shares / vol20) if vol20 > 0 else None, "tw": is_tw_symbol(sym),
-    }
-
-
-def _parse_date_str(s):
-    s = str(s or "").strip().replace("/", "-")
-    try:
-        return datetime.date.fromisoformat(s) if s else None
-    except Exception:
-        return None
-
-
-def remove_holding(i):
-    if 0 <= i < len(st.session_state.holdings):
-        st.session_state.holdings.pop(i)
-        _data_save()
-
-
-def _qty_txt(shares, tw):
-    return (f"{shares // 1000} 張" + (f"＋零股 {shares % 1000} 股" if shares % 1000 else "")) if tw else f"{shares} 股"
-
-
-def render_holdings():
-    st.markdown("##### 💼 持有股票試算：損益、停損、分批出場、整體風險")
-    st.caption("輸入你實際的成本與股數，系統幫你算：現在賺賠多少、停損價該放哪、什麼價位分批賣、全部持股的風險有多大。只是試算，不會真的下單。")
-
-    with st.form("holding_form", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns([1.6, 1.1, 1, 1])
-        f_name = c1.text_input("股票代號或名稱（留白＝目前搜尋的股票）")
-        f_cost = c2.number_input("成本價（每股）", min_value=0.0, step=0.01, format="%.2f")
-        f_lots = c3.number_input("張數", min_value=0, step=1)
-        f_odd = c4.number_input("零股（股）", min_value=0, max_value=999, step=1)
-        c5, c6 = st.columns(2)
-        f_date = c5.text_input("買進日期（選填，例：2026-10-20）", help="填了就能算出買進後的最高價，移動停利才準；沒填就用近 20 日最高價。")
-        f_stop = c6.number_input("自己的停損價（選填，0＝自動用 成本−2×ATR）", min_value=0.0, step=0.01, format="%.2f")
-        ok = st.form_submit_button("➕ 加入持股", type="primary")
-    if ok:
-        shares = int(f_lots) * 1000 + int(f_odd)
-        sym, name = resolve_input_symbol(f_name)
-        if not sym:
-            st.error("找不到這檔股票，請檢查代號或名稱。")
-        elif f_cost <= 0 or shares <= 0:
-            st.error("成本價與股數都要大於 0。")
-        elif f_date.strip() and not _parse_date_str(f_date):
-            st.error("買進日期格式請填 YYYY-MM-DD。")
-        else:
-            st.session_state.holdings.append({
-                "name": name or sym, "symbol": sym, "cost": float(f_cost), "shares": shares,
-                "date": f_date.strip(), "stop": float(f_stop),
-            })
-            _data_save()
-            st.rerun()
-
-    hs = st.session_state.holdings
-    if not hs:
-        st.info("還沒有持股。在上方填入成本價與股數，按「加入持股」。")
-        return
-
-    calcs = []
-    with st.spinner("⏳ 分析中，請稍候…"):
-        for h in hs:
-            try:
-                daily = k2_resample(fetch_history(h["symbol"], "2y"), "日", tail=None)
-                try:
-                    live = fetch_realtime_quote(h["symbol"])["price"]
-                except Exception:
-                    live = None
-                calcs.append(holding_calc(h, daily, live))
-            except Exception:
-                calcs.append(None)
-
-    ok_items = [(h, c) for h, c in zip(hs, calcs) if c]
-    total_mv = sum(c["mv"] for _, c in ok_items)
-    total_pnl = sum(c["pnl"] for _, c in ok_items)
-    total_risk = sum(max(c["risk"], 0) for _, c in ok_items)
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("持股總市值", f"{total_mv:,.0f} 元")
-    m2.metric("未實現損益（已扣成本）", f"{total_pnl:+,.0f} 元", delta_color="inverse")
-    m3.metric("持股檔數", f"{len(ok_items)} 檔")
-    m4.metric("全部觸及停損的總虧損", f"{total_risk:,.0f} 元", help="每一檔都跌到「目前停損價」時的合計虧損；停損價高於成本的不計入。")
-    warns = []
-    if len(ok_items) >= 2 and total_mv > 0:
-        top = max(ok_items, key=lambda x: x[1]["mv"])
-        if top[1]["mv"] / total_mv > 0.4:
-            warns.append(f"「{top[0]['name']}」占持股市值 {top[1]['mv'] / total_mv * 100:.0f}%，過度集中，單一股票出事影響很大。")
-    for w in warns:
-        st.warning("⚠️ " + w)
-
-    for i, (h, c) in enumerate(zip(hs, calcs)):
-        with st.container(border=True):
-            if not c:
-                st.markdown(f"**{h['name']}（{h['symbol']}）**　取不到價格資料，暫時無法試算。")
-                st.button("🗑️ 移除", key=f"hold_rm_{i}", on_click=remove_holding, args=(i,))
-                continue
-            tw = c["tw"]
-            st.markdown(f"#### {h['name']}（{h['symbol']}）　{_qty_txt(h['shares'], tw)}　成本 {h['cost']:.2f}")
-            a1, a2, a3, a4 = st.columns(4)
-            a1.metric("現價", f"{c['px']:.2f}", f"{(c['px'] / h['cost'] - 1) * 100:+.2f}%", delta_color="inverse")
-            a2.metric("損益（已扣成本）", f"{c['pnl']:+,.0f} 元", f"{c['pnl_pct'] * 100:+.2f}%", delta_color="inverse")
-            a3.metric("目前停損價", f"{c['active']:.2f}", f"距現價 {(c['active'] / c['px'] - 1) * 100:+.1f}%", delta_color="off")
-            a4.metric("若停損", f"{-c['risk']:+,.0f} 元", help="負數＝虧損；正數＝停損價已高於成本，已鎖住獲利。")
-            st.markdown(c["status"])
-            third = h["shares"] // 3
-            plan = [
-                f"- 🎯 **第 1 批**：漲到 {_pz(c['t1'])}（賺 1R）賣出約 {_qty_txt(third, tw)}，停損上移到成本價（保本）",
-                f"- 🎯 **第 2 批**：漲到 {_pz(c['t2'])}（賺 2R）再賣約 {_qty_txt(third, tw)}，之後改用移動停損",
-                f"- 🏁 **剩下的**：用移動停損——停損價 ＝ 買進後最高價 {c['hh']:.2f} − 2.5×ATR（{c['atr']:.2f}）；續漲到 {_pz(c['t3'])}（賺 3R）以上可繼續抱",
-                f"- 🛑 **目前停損價**：{_pz(c['active'])}（原始停損 {c['stop0']:.2f}，1R＝{c['R']:.2f} 元）",
-            ]
-            if c["liq"] is not None:
-                plan.append(f"- 💧 **流動性**：持股量約占日均量 {c['liq'] * 100:.2f}%" + ("　⚠️ 偏高，出場要分批" if c["liq"] >= 0.02 else "　✅"))
-            st.markdown("\n".join(plan), unsafe_allow_html=True)
-            st.button("🗑️ 移除這筆持股", key=f"hold_rm_{i}", on_click=remove_holding, args=(i,))
-    st.caption("1R＝成本價到停損價的距離，代表這筆交易願意承擔的風險；分批與移動停損是常見的出場紀律，不是保證。"
-               "損益已扣掉買賣手續費（以 6 折計）與證交稅 0.3%。")
-
-
-JOURNAL_REASONS = [p[0] for p in K2_PATTERNS] + ["均線／趨勢", "基本面／營收", "籌碼", "其他"]
-
-
-def remove_journal(i):
-    if 0 <= i < len(st.session_state.journal):
-        st.session_state.journal.pop(i)
-        _data_save()
-
-
-def _journal_calc(e):
-    """單筆日誌的淨損益與報酬（已賣出才有）；含手續費與證交稅。"""
-    if not e.get("sell_px"):
-        return None
-    fee, tax = _fees(e["symbol"])
-    cost = e["buy_px"] * e["shares"] * (1 + fee)
-    net = e["sell_px"] * e["shares"] * (1 - fee - tax) - cost
-    return net, net / cost
-
-
-def render_journal():
-    st.markdown("##### 📓 交易日誌：記下每筆交易的理由，之後回頭看哪類訊號對你真的有效")
-    with st.form("journal_form", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns([1.6, 1.2, 1, 1])
-        j_name = c1.text_input("股票代號或名稱（留白＝目前搜尋的股票）")
-        j_bd = c2.text_input("買進日期", value=datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d"))
-        j_bp = c3.number_input("買進價", min_value=0.0, step=0.01, format="%.2f")
-        j_lots = c4.number_input("張數", min_value=0, step=1)
-        c5, c6, c7, c8 = st.columns([1.2, 1.2, 1, 1.6])
-        j_reason = c5.selectbox("進場理由", JOURNAL_REASONS)
-        j_sd = c6.text_input("賣出日期（還沒賣就留白）")
-        j_sp = c7.number_input("賣出價（0＝還沒賣）", min_value=0.0, step=0.01, format="%.2f")
-        j_odd = c8.number_input("零股（股）", min_value=0, max_value=999, step=1)
-        j_note = st.text_input("備註（當時為什麼這樣做、事後檢討）")
-        ok = st.form_submit_button("➕ 新增一筆", type="primary")
-    if ok:
-        sym, name = resolve_input_symbol(j_name)
-        shares = int(j_lots) * 1000 + int(j_odd)
-        if not sym:
-            st.error("找不到這檔股票，請檢查代號或名稱。")
-        elif j_bp <= 0 or shares <= 0:
-            st.error("買進價與股數都要大於 0。")
-        elif not _parse_date_str(j_bd) or (j_sd.strip() and not _parse_date_str(j_sd)):
-            st.error("日期格式請填 YYYY-MM-DD。")
-        elif j_sp > 0 and not j_sd.strip():
-            st.error("填了賣出價，也請填賣出日期。")
-        else:
-            st.session_state.journal.append({
-                "name": name or sym, "symbol": sym, "buy_date": j_bd.strip(), "buy_px": float(j_bp), "shares": shares,
-                "reason": j_reason, "sell_date": j_sd.strip(), "sell_px": float(j_sp), "note": j_note.strip(),
-            })
-            _data_save()
-            st.rerun()
-
-    js = st.session_state.journal
-    if not js:
-        st.info("還沒有紀錄。每次買進就記一筆，賣出後回來補上賣出日期與價格。")
-        return
-    rows, closed = [], []
-    for e in js:
-        calc = _journal_calc(e)
-        days = ""
-        if e.get("sell_date") and _parse_date_str(e["sell_date"]) and _parse_date_str(e["buy_date"]):
-            days = (_parse_date_str(e["sell_date"]) - _parse_date_str(e["buy_date"])).days
-        rows.append({
-            "股票": f"{e['name']}", "買進日": e["buy_date"], "買進價": e["buy_px"], "股數": e["shares"], "理由": e["reason"],
-            "賣出日": e.get("sell_date") or "持有中", "賣出價": e.get("sell_px") or None,
-            "報酬": f"{calc[1] * 100:+.2f}%" if calc else "—", "淨損益（元）": round(calc[0]) if calc else None,
-            "持有天數": days, "備註": e.get("note", ""),
-        })
-        if calc:
-            closed.append((e, calc))
-    st.dataframe(pd.DataFrame(rows[::-1]), hide_index=True, width="stretch")
-
-    if closed:
-        pnl = np.array([c[0] for _, c in closed])
-        rets = np.array([c[1] for _, c in closed])
-        wins, losses = pnl[pnl > 0], pnl[pnl <= 0]
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("已結束交易", f"{len(closed)} 筆")
-        m2.metric("勝率", f"{(pnl > 0).mean() * 100:.0f}%")
-        m3.metric("平均報酬", f"{rets.mean() * 100:+.2f}%")
-        m4.metric("獲利因子", "∞" if not len(losses) or losses.sum() == 0 else f"{wins.sum() / abs(losses.sum()):.2f}",
-                  f"總淨損益 {pnl.sum():+,.0f} 元", delta_color="off")
-        by = {}
-        for e, c in closed:
-            by.setdefault(e["reason"], []).append(c)
-        st.markdown("**依進場理由統計**（看哪一類訊號對你真的有效；筆數少時只供參考）")
-        st.dataframe(pd.DataFrame([{
-            "進場理由": k, "筆數": len(v), "勝率": f"{np.mean([x[0] > 0 for x in v]) * 100:.0f}%",
-            "平均報酬": f"{np.mean([x[1] for x in v]) * 100:+.2f}%", "總淨損益（元）": round(sum(x[0] for x in v)),
-        } for k, v in sorted(by.items(), key=lambda kv: -len(kv[1]))]), hide_index=True, width="stretch")
-        if len(closed) < 20:
-            st.caption("⚠️ 已結束的交易少於 20 筆，統計還不穩定，持續記錄才看得出你的優勢在哪。")
-    else:
-        st.caption("還沒有已賣出的交易；補上賣出日期與價格後，這裡會統計勝率與各種理由的成績。")
-
-    pick = st.selectbox("刪除某一筆", range(len(js)), format_func=lambda k: f"{js[k]['buy_date']}　{js[k]['name']}　{js[k]['reason']}", key="journal_pick")
-    st.button("🗑️ 刪除這筆", key="journal_del", on_click=remove_journal, args=(pick,))
-    st.caption("淨損益已扣手續費（以 6 折計）與證交稅 0.3%；日誌存在本機檔案，多人共用同一個網站時大家會看到同一份。")
-
-
 # ---------------------------------------------------------------------------
 # 主畫面：輸入區
 # ---------------------------------------------------------------------------
 # 全站共用的搜尋列：放在所有頁籤上方，在哪個頁籤都能直接搜尋；
-# 搜尋後「個股分析」、「K線分析」、「K線分析2」會一起顯示同一檔股票。
+# 搜尋後「個股分析」、「K線分析」會一起顯示同一檔股票。
 mobile = is_mobile()
 if mobile:
     # 手機：輸入框與按鈕由上而下全寬排列
@@ -5475,60 +5324,107 @@ with btn_col:
     )
 
 summary_slot = st.empty()  # 綜合判斷卡：K線分頁算完後再填入（需要用到它們的結果）
+entry_slot = st.empty()    # 隔日進出場參考：緊接在綜合判斷卡下方，由 K線分析計算後填入
 
-# 頁籤做成「按鈕」的樣子：每個功能都有一個和「停止搜尋」按鈕一樣的淺色外框，目前所在的那顆外框與文字變主色。
-# 同時寫了幾組選擇器（舊版／新版 Streamlit 的頁籤標籤名稱不太一樣），確保都能套用。
-_TAB_CSS = """
-<style>
-div[data-baseweb="tab-list"], div[role="tablist"], .stTabs [data-baseweb="tab-list"]{
-    flex-wrap:wrap !important; gap:8px !important; row-gap:8px !important;
-    overflow:visible !important; border-bottom:none !important; padding:4px 2px !important;
+# 頁籤做成立體膠囊按鈕：銀色金屬外框 + 彩色亮面漸層 + 白色粗體字，每個功能一種顏色。
+# 目前所在的頁籤放大、加深陰影；其他頁籤稍微變淡。
+# 同一份 CSS 用三種方式套用（st.markdown、st.html、腳本直接塞進網頁 <head>），
+# 並涵蓋新舊版 Streamlit 的頁籤標籤名稱，確保都能生效。
+_TAB_BTN = ['button[role="tab"]', 'button[data-baseweb="tab"]', 'button[data-testid="stTab"]']
+_TAB_LIST = ['[role="tablist"]', '[data-baseweb="tab-list"]', '[data-testid="stTabs"] > div:first-child']
+
+
+def _tb(pre="", post=""):
+    return ", ".join(f"{x}{pre}{post}" for x in _TAB_BTN)
+
+
+def _tl():
+    return ", ".join(_TAB_LIST)
+
+
+_TAB_PILL_CSS = (
+    _tl() + """{
+    flex-wrap:wrap !important; gap:14px !important; row-gap:16px !important;
+    overflow:visible !important; border-bottom:none !important; padding:10px 6px 16px !important;
 }
-div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"],
-.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"]{
+[data-baseweb="tab-highlight"], [data-baseweb="tab-border"], [data-testid="stTabHighlight"], [data-testid="stTabBorder"]{
     display:none !important; height:0 !important; background:transparent !important;
 }
-button[data-baseweb="tab"], button[role="tab"], .stTabs [data-baseweb="tab"]{
-    height:auto !important; margin:0 !important; padding:.45rem .9rem !important;
-    border:1px solid rgba(128,128,128,.40) !important; border-radius:.5rem !important;
-    background:transparent !important; box-shadow:none !important; transition:border-color .15s, background .15s;
+""" + _tb() + """{
+    --c1:#ffb347; --c2:#f26d12;
+    height:auto !important; margin:0 !important; padding:.65rem 1.7rem !important;
+    border:5px solid transparent !important; border-radius:999px !important;
+    background:
+        linear-gradient(180deg, var(--c1) 0%, var(--c2) 100%) padding-box,
+        linear-gradient(180deg, #f4f4f4 0%, #9a9a9a 48%, #e6e6e6 100%) border-box !important;
+    box-shadow:inset 0 3px 4px rgba(255,255,255,.55), inset 0 -3px 5px rgba(0,0,0,.25), 0 3px 6px rgba(0,0,0,.35) !important;
+    cursor:pointer !important; opacity:.85; filter:saturate(.7);
+    transition:transform .15s, filter .15s, opacity .15s, box-shadow .15s;
 }
-button[data-baseweb="tab"]:hover, button[role="tab"]:hover, .stTabs [data-baseweb="tab"]:hover{
-    border-color:var(--primary-color,#ff4b4b) !important; background:rgba(255,75,75,.08) !important;
+""" + _tb(":nth-of-type(1)") + """{--c1:#ffb347; --c2:#f26d12}
+""" + _tb(":nth-of-type(2)") + """{--c1:#63cbf7; --c2:#1b7ad1}
+""" + _tb(":nth-of-type(3)") + """{--c1:#93d653; --c2:#3a9528}
+""" + _tb(":nth-of-type(4)") + """{--c1:#f5706b; --c2:#c0141b}
+""" + _tb(":nth-of-type(5)") + """{--c1:#a77ae0; --c2:#5a2a9e}
+""" + _tb(":hover") + """{opacity:1; filter:saturate(1) brightness(1.08); transform:translateY(-2px)}
+""" + _tb("", " p") + ", " + _tb("", " span") + """{
+    font-size:1.35rem !important; font-weight:700 !important; margin:0 !important;
+    color:#fff !important; text-shadow:0 1px 3px rgba(0,0,0,.5); white-space:nowrap;
 }
-button[data-baseweb="tab"] p, button[role="tab"] p, .stTabs [data-baseweb="tab"] p{
-    font-size:1rem !important; margin:0 !important;
+""" + _tb('[aria-selected="true"]') + """{
+    opacity:1; filter:saturate(1.15) brightness(1.05); transform:scale(1.08);
+    box-shadow:inset 0 3px 4px rgba(255,255,255,.65), inset 0 -3px 5px rgba(0,0,0,.3), 0 7px 14px rgba(0,0,0,.45) !important;
 }
-button[data-baseweb="tab"][aria-selected="true"], button[role="tab"][aria-selected="true"],
-.stTabs [data-baseweb="tab"][aria-selected="true"]{
-    border:1.5px solid var(--primary-color,#ff4b4b) !important; background:rgba(255,75,75,.10) !important;
-}
-button[data-baseweb="tab"][aria-selected="true"] p, button[role="tab"][aria-selected="true"] p,
-.stTabs [data-baseweb="tab"][aria-selected="true"] p{
-    color:var(--primary-color,#ff4b4b) !important; font-weight:700 !important;
-}
+""" + _tb('[aria-selected="true"]', " p") + """{font-weight:900 !important}
 @media (max-width:640px){
-    button[data-baseweb="tab"], button[role="tab"]{padding:.35rem .6rem !important}
-    button[data-baseweb="tab"] p, button[role="tab"] p{font-size:.9rem !important}
+    """ + _tl() + """{gap:10px !important; row-gap:12px !important}
+    """ + _tb() + """{padding:.4rem 1rem !important; border-width:4px !important}
+    """ + _tb("", " p") + """{font-size:1.05rem !important}
 }
-</style>
 """
-st.markdown(_TAB_CSS, unsafe_allow_html=True)
+)
+_TAB_PILL_CSS = "\n".join(ln for ln in _TAB_PILL_CSS.splitlines() if ln.strip())  # 不留空行，避免被當成 markdown 段落
+st.markdown("<style>" + _TAB_PILL_CSS + "</style>", unsafe_allow_html=True)
+try:
+    st.html("<style>" + _TAB_PILL_CSS + "</style>")
+except Exception as _exc:
+    _note_err("_tl", _exc)
+    pass
 
-tab_stock, tab_kline, tab_kline2, tab_watch, tab_hold, tab_journal, tab_rank, tab_inst = st.tabs(
-    ["🔍 個股分析", "📐 K線分析", "📐 K線分析2", "⭐ 觀察清單", "💼 持有股票試算", "📓 交易日誌",
-     "🔥 即時市場排行", "🏦 前一交易日買超賣超"]
+import json as _json
+import streamlit.components.v1 as components
+
+components.html(
+    """
+<script>
+(function () {
+  var doc;
+  try { doc = window.parent.document; } catch (e) { return; }
+  var css = __CSS__;
+  function inject() {
+    var el = doc.getElementById('tab-pill-style');
+    if (!el) { el = doc.createElement('style'); el.id = 'tab-pill-style'; doc.head.appendChild(el); }
+    if (el.textContent !== css) el.textContent = css;
+  }
+  inject();
+  try { if (window.parent.__tabPillTimer) window.parent.clearInterval(window.parent.__tabPillTimer); } catch (e) {}
+  window.parent.__tabPillTimer = window.parent.setInterval(inject, 1500);
+})();
+</script>
+""".replace("__CSS__", _json.dumps(_TAB_PILL_CSS)),
+    height=1,
+)
+
+tab_stock, tab_kline, tab_rank, tab_inst = st.tabs(
+    ["🔍 個股分析", "📐 K線分析", "🔥 即時市場排行", "🏦 前一交易日買超賣超"]
 )
 
 # K線頁籤先放「分析中」佔位：搜尋與載入期間畫面不會空白、也看得出有在動作；
 # 資料備妥後，下方再把佔位整塊換成真正內容。
 with tab_kline:
     kline_slot = st.empty()
-with tab_kline2:
-    kline2_slot = st.empty()
 if st.session_state.pending_search or st.session_state.get("_k_done_for", "") != st.session_state.trigger_search:
     kline_slot.info("⏳ 分析中，請稍候…")
-    kline2_slot.info("⏳ 分析中，請稍候…")
     summary_slot.info("⏳ 分析中，請稍候…")
 
 with tab_stock:
@@ -5553,32 +5449,27 @@ with tab_stock:
     if pending:
         st.session_state.pending_search = ""
         with result_slot.container():
+            _prog = st.empty()  # 顯示目前進行到哪一步，卡住時看得出卡在哪
             with st.spinner(f"⏳ 分析「{pending}」中，請稍候…"):
-                run_search(pending)
+                with _timed("搜尋（找代號＋驗證）"):
+                    run_search(pending, progress=_prog)
+            _prog.empty()
             # 查詢完成後、結果畫出來之前，保留提示（結果區稍後會被整塊換成分析內容）
             st.info("⏳ 分析中，請稍候…")
 
 # K線分析頁籤：放在搜尋處理之後、較慢的個股分析結果之前渲染。
-# 這樣不論是在哪個頁籤搜尋，這裡讀到的都是最新的「目前股票」，三個頁籤會同步顯示同一檔股票。
-with kline_slot.container():
+# 這樣不論是在哪個頁籤搜尋，這裡讀到的都是最新的「目前股票」，各頁籤會同步顯示同一檔股票。
+# 「K線分析」頁籤同時放兩塊內容：上半是進出場預測（均線、指標、量價），下半是 18 種K線型態標註
+with kline_slot.container(), _timed("K線分析"):
     render_kline_analysis()
-
-with kline2_slot.container():
-    render_kline_analysis2()
+    if current_stock()[0]:  # 有股票才顯示型態區；沒有股票或查詢失敗時，上半已顯示提示，不重複
+        st.divider()
+        render_kline_analysis2()
 
 st.session_state["_k_done_for"] = st.session_state.trigger_search
 
-with summary_slot.container():
+with summary_slot.container(), _timed("綜合判斷"):
     render_summary_card()
-
-with tab_watch:
-    render_watchlist()
-
-with tab_hold:
-    render_holdings()
-
-with tab_journal:
-    render_journal()
 
 # ---------------------------------------------------------------------------
 # 側邊欄：搜尋紀錄
@@ -5617,6 +5508,18 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(f"👀 **網站累積瀏覽次數：{_total:,} 次**")
     st.caption(f"今日 {_today:,} 次（每次開啟或重新整理網頁算 1 次）")
+    st.caption("介面版本：v5（膠囊頁籤、按需載入、K線頁籤合併）")
+    _errs = _err_snapshot()
+    with st.expander(f"🛠 資料來源狀態與耗時（{len(_errs)} 筆異常）", expanded=False):
+        _tm = st.session_state.get("_timings") or {}
+        if _tm:
+            st.caption("⏱ 上一次分析各區塊耗時：" + "　".join(f"{k} {v:.1f}秒" for k, v in _tm.items()))
+        if not _errs:
+            st.caption("目前沒有異常記錄 ✅")
+        else:
+            st.caption("以下是程式內部被略過的錯誤（同類只記一筆），資料缺漏時可參考；多半是暫時性的網路問題。")
+            for (_w, _t, _m), _n, _ts in _errs[:20]:
+                st.text(f"[{_ts}] {_w}\n{_t}: {_m}（×{_n}）")
 
 
 
@@ -5636,7 +5539,7 @@ elif trigger.startswith("FAILED:"):
             st.warning("⚠️ 目前無法連線取得台股中文名稱清單，請改輸入股票代號（例如 2383），或檢查網路連線。")
 
 else:
-    with result_slot.container():
+    with result_slot.container(), _timed("個股分析"):
         render_analysis(trigger.upper(), time_period)
 
 stop_slot.empty()  # 載入完成，移除停止按鈕
@@ -5645,8 +5548,18 @@ stop_slot.empty()  # 載入完成，移除停止按鈕
 # ---------------------------------------------------------------------------
 # 較慢的頁籤放最後渲染（需要連線抓大量資料），避免擋住前面頁籤的畫面
 # ---------------------------------------------------------------------------
+def _lazy_tab(key, label, render_fn):
+    """較慢的頁籤：按下按鈕才載入（沒打開的人不用等這些資料），載入後可按「收起」停止每次重跑。"""
+    if st.session_state.get(key):
+        st.button("⏏ 收起（暫停載入）", key=f"{key}_off", on_click=st.session_state.__setitem__, args=(key, False))
+        render_fn()
+    else:
+        st.button(label, key=f"{key}_on", type="primary", on_click=st.session_state.__setitem__, args=(key, True))
+        st.caption("為了加快其他頁籤的速度，這個頁籤的資料要按按鈕才會載入。")
+
+
 with tab_inst:
-    render_prev_day_institutional_rank()
+    _lazy_tab("lazy_inst", "📥 載入前一交易日買超賣超", render_prev_day_institutional_rank)
 
 with tab_rank:
-    render_market_rank()
+    _lazy_tab("lazy_rank", "📥 載入即時市場排行", render_market_rank)
